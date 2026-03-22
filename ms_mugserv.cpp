@@ -8,6 +8,10 @@
  * is required; no manual registration step needed.
  * Data is stored in <services datadir>/mugserv.db (flat text, human-readable).
  *
+ * Channel mode: the bot joins configured channels and responds to !command triggers.
+ * Use /msg MugServ ENABLE #channel and DISABLE #channel to add/remove channels at
+ * runtime. Users may also still /msg MugServ directly.
+ *
  * ─── services.conf ───────────────────────────────────────────────────────────
  *  module { name = "ms_mugserv"; }
  *
@@ -21,9 +25,10 @@
  *
  *  ms_mugserv
  *  {
- *      client           = "MugServ"
- *      announce_channel = "#general"      # public mug/bet results (optional)
- *      # admin_nicks = "Nick1 Nick2"      # extra MugServ admins beyond IRCops
+ *      client      = "MugServ"
+ *      channels    = "#general #gaming"  # channels where the bot listens (optional)
+ *      cmd_prefix  = "!"                 # trigger prefix in channels (default: !)
+ *      # admin_nicks = "Nick1 Nick2"     # extra MugServ admins beyond IRCops
  *  }
  * ─────────────────────────────────────────────────────────────────────────────
  *
@@ -41,6 +46,7 @@
 #include <iomanip>
 #include <map>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -213,8 +219,12 @@ static int inv_sum(const MugUser &u, int ItemDef::*fld)
 // ===========================================================================
 
 static BotInfo                               *s_bot            = nullptr;
-static Anope::string                          s_announce_chan;
+static std::set<Anope::string>                s_channels;       // lowercased channel names
+static Anope::string                          s_cmd_prefix      = "!";
 static std::vector<Anope::string>             s_admin_nicks;
+// Set by OnMessage before dispatching — announce() uses this to reply to the
+// originating channel. Cleared after dispatch. Empty = PM-triggered.
+static Anope::string                          s_current_chan;
 
 // nick.lower() → MugUser
 static std::map<Anope::string, MugUser>       s_users;
@@ -237,6 +247,9 @@ static void save_db()
         return;
 
     f << "# MugServ database v1 — do not edit while service is running\n";
+
+    for (const auto &ch : s_channels)
+        f << "CHANNEL " << ch.c_str() << "\n";
 
     for (const auto &kv : s_users)
     {
@@ -278,7 +291,14 @@ static void load_db()
         std::string tag;
         ss >> tag;
 
-        if (tag == "USER")
+        if (tag == "CHANNEL")
+        {
+            std::string ch;
+            ss >> ch;
+            if (!ch.empty())
+                s_channels.insert(Anope::string(ch).lower());
+        }
+        else if (tag == "USER")
         {
             MugUser u;
             std::string acct, nick;
@@ -336,13 +356,29 @@ static bool is_admin(CommandSource &src)
     return false;
 }
 
-// Send to the announce channel (if configured), otherwise fall back to user PM.
-static void announce(CommandSource &src, const Anope::string &msg)
+// Send a public message: if s_current_chan is set (channel-triggered command),
+// reply there; otherwise broadcast to all active channels (PM-triggered command).
+// Falls back to user PM if no channels are configured.
+static void announce(CommandSource &src, const Anope::string &msg,
+                     const Anope::string &chan = "")
 {
-    if (!s_announce_chan.empty() && s_bot)
-        s_bot->Say(s_announce_chan, msg);
+    // Prefer explicit channel arg, then s_current_chan, then broadcast/PM.
+    const Anope::string &dest = !chan.empty() ? chan : s_current_chan;
+    if (!s_bot) { src.Reply("%s", msg.c_str()); return; }
+    if (!dest.empty())
+    {
+        s_bot->Say(dest, msg);
+    }
+    else if (!s_channels.empty())
+    {
+        // PM-triggered with no current channel: broadcast to all active channels.
+        for (const auto &ch : s_channels)
+            s_bot->Say(ch, msg);
+    }
     else
+    {
         src.Reply("%s", msg.c_str());
+    }
 }
 
 // Always reply to the user (PM from MugServ).
@@ -579,8 +615,6 @@ struct CommandMugCoins : Command
         Anope::string msg = "💰 " + u.nick + " found \002" + fmt_coins(gain)
                           + "\002 coins! Balance: \002" + fmt_coins(u.coins) + "\002 coins.";
         announce(src, msg);
-        if (!s_announce_chan.empty())
-            pm(src, msg);
     }
 };
 
@@ -696,8 +730,6 @@ struct CommandMugGive : Command
         Anope::string msg = "🤝 \002" + giver.nick + "\002 gave \002" + fmt_coins(amt)
                           + "\002 coins to \002" + recv->nick + "\002!";
         announce(src, msg);
-        if (!s_announce_chan.empty())
-            pm(src, msg);
     }
 };
 
@@ -799,7 +831,6 @@ struct CommandMugMug : Command
                 + att.nick + ": " + fmt_coins(att.coins)
                 + " | " + vic->nick + ": " + fmt_coins(vic->coins);
             announce(src, msg);
-            if (!s_announce_chan.empty()) pm(src, msg);
             return;
         }
 
@@ -838,7 +869,6 @@ struct CommandMugMug : Command
                     + " | " + att.nick + ": " + fmt_coins(att.coins)
                     + " | " + vic->nick + ": " + fmt_coins(vic->coins);
                 announce(src, msg);
-                if (!s_announce_chan.empty()) pm(src, msg);
             }
             else
             {
@@ -849,7 +879,6 @@ struct CommandMugMug : Command
                     + " | " + att.nick + ": " + fmt_coins(att.coins)
                     + " | " + vic->nick + ": " + fmt_coins(vic->coins);
                 announce(src, msg);
-                if (!s_announce_chan.empty()) pm(src, msg);
             }
         };
 
@@ -878,7 +907,6 @@ struct CommandMugMug : Command
                     + " | " + att.nick + ": " + fmt_coins(att.coins)
                     + " | " + vic->nick + ": " + fmt_coins(vic->coins);
                 announce(src, msg);
-                if (!s_announce_chan.empty()) pm(src, msg);
                 return;
             }
 
@@ -890,7 +918,6 @@ struct CommandMugMug : Command
                     + " | " + att.nick + ": " + fmt_coins(att.coins)
                     + " | " + vic->nick + ": " + fmt_coins(vic->coins);
                 announce(src, msg);
-                if (!s_announce_chan.empty()) pm(src, msg);
                 return;
             }
 
@@ -950,7 +977,6 @@ struct CommandMugMug : Command
                 + " | " + att.nick + ": " + fmt_coins(att.coins)
                 + " | " + vic->nick + ": " + fmt_coins(vic->coins);
             announce(src, msg);
-            if (!s_announce_chan.empty()) pm(src, msg);
             return;
         }
 
@@ -970,7 +996,6 @@ struct CommandMugMug : Command
                 + " | " + att.nick + ": " + fmt_coins(att.coins)
                 + " | " + vic->nick + ": " + fmt_coins(vic->coins);
             announce(src, msg);
-            if (!s_announce_chan.empty()) pm(src, msg);
             return;
         }
 
@@ -1036,7 +1061,6 @@ struct CommandMugBet : Command
         }
 
         announce(src, msg);
-        if (!s_announce_chan.empty()) pm(src, msg);
     }
 };
 
@@ -1104,7 +1128,6 @@ struct CommandMugBounty : Command
             {{"vic", vic->nick}, {"amt", fmt_coins(amt)}})
             + " (" + placer.nick + " now has " + fmt_coins(placer.coins) + " coins)";
         announce(src, msg);
-        if (!s_announce_chan.empty()) pm(src, msg);
     }
 };
 
@@ -1509,8 +1532,17 @@ struct CommandMugStats : Command
         if (!sorted.empty())
             pm(src, "  Top 5: " + format_lb(sorted, 1));
 
-        if (!s_announce_chan.empty())
-            pm(src, "  Announce channel: " + s_announce_chan);
+        if (!s_channels.empty())
+        {
+            Anope::string chlist;
+            for (const auto &ch : s_channels) { if (!chlist.empty()) chlist += " "; chlist += ch; }
+            pm(src, "  Active channels (" + stringify(static_cast<int>(s_channels.size())) + "): " + chlist);
+            pm(src, "  Command prefix: " + s_cmd_prefix);
+        }
+        else
+        {
+            pm(src, "  Active channels: none (PM only)");
+        }
         pm(src, "  NickServ identification: always required");
         pm(src, "  DB path: " + db_path());
     }
@@ -1527,11 +1559,12 @@ struct CommandMugHelp : Command
 
     void Execute(CommandSource &src, const std::vector<Anope::string> &) override
     {
-        pm(src, "📖 \002MugServ Help\002 — all commands via /msg MugServ <COMMAND>");
+        pm(src, "📖 \002MugServ Help\002 — /msg MugServ <COMMAND>  or  " + s_cmd_prefix + "command in an active channel");
         pm(src, "");
         pm(src, "\002Access\002");
         pm(src, "  A NickServ account is required. Identify first: /msg NickServ IDENTIFY <pass>");
         pm(src, "  You are automatically enrolled the first time you send any command.");
+        pm(src, "  In channels, prefix commands with \002" + s_cmd_prefix + "\002 (e.g. \002" + s_cmd_prefix + "coins\002).");
         pm(src, "");
         pm(src, "\002Economy\002");
         pm(src, "  COINS                 — Collect coins (10-min cooldown, scales with wealth)");
@@ -1580,6 +1613,82 @@ struct CommandMugHelp : Command
         pm(src, "  MUGTAKE <nick> <amt>  — Remove coins");
         pm(src, "  MUGRESET [confirm]    — Reset ALL data");
         pm(src, "  MUGSTATS              — Economy overview");
+        pm(src, "  ENABLE <#channel>     — Add a channel (bot joins + listens)");
+        pm(src, "  DISABLE <#channel>    — Remove a channel");
+        pm(src, "");
+        pm(src, "\002Channel Usage\002");
+        pm(src, "  In any active channel, prefix commands with \002" + s_cmd_prefix + "\002:");
+        pm(src, "  " + s_cmd_prefix + "coins   " + s_cmd_prefix + "mug Nick   "
+                + s_cmd_prefix + "bet 100   " + s_cmd_prefix + "top5");
+        pm(src, "  SHOP, BUY, INV, USE and admin commands always reply via PM.");
+        pm(src, "  You can also always /msg MugServ directly.");
+    }
+};
+
+// ─── Admin: ENABLE ──────────────────────────────────────────────────────────
+struct CommandMugEnable : Command
+{
+    CommandMugEnable(Module *c) : Command(c, "mugserv/ENABLE", 1, 1)
+    {
+        SetDesc("[Admin] Enable MugServ in a channel");
+        SetSyntax("<#channel>");
+    }
+
+    void Execute(CommandSource &src, const std::vector<Anope::string> &params) override
+    {
+        if (!is_admin(src)) { pm(src, "Access denied."); return; }
+        Anope::string chan = params[0].lower();
+        if (chan.empty() || chan[0] != '#')
+        {
+            pm(src, "Provide a channel name starting with #.");
+            return;
+        }
+        if (s_channels.count(chan))
+        {
+            pm(src, chan + " is already active.");
+            return;
+        }
+        s_channels.insert(chan);
+        // Have the bot join the channel if not already there.
+        if (s_bot)
+        {
+            Channel *c = Channel::Find(chan);
+            if (!c || !c->FindUser(s_bot))
+                s_bot->Join(chan);
+        }
+        save_db();
+        pm(src, "✅ MugServ is now active in " + chan + ".");
+    }
+};
+
+// ─── Admin: DISABLE ─────────────────────────────────────────────────────────
+struct CommandMugDisable : Command
+{
+    CommandMugDisable(Module *c) : Command(c, "mugserv/DISABLE", 1, 1)
+    {
+        SetDesc("[Admin] Disable MugServ in a channel");
+        SetSyntax("<#channel>");
+    }
+
+    void Execute(CommandSource &src, const std::vector<Anope::string> &params) override
+    {
+        if (!is_admin(src)) { pm(src, "Access denied."); return; }
+        Anope::string chan = params[0].lower();
+        if (!s_channels.count(chan))
+        {
+            pm(src, chan + " is not in the active channel list.");
+            return;
+        }
+        s_channels.erase(chan);
+        // Part the channel if the bot is there and no other reason to stay.
+        if (s_bot)
+        {
+            Channel *c = Channel::Find(chan);
+            if (c && c->FindUser(s_bot))
+                s_bot->Part(c);
+        }
+        save_db();
+        pm(src, "✅ MugServ disabled in " + chan + ".");
     }
 };
 
@@ -1610,6 +1719,8 @@ class ModuleMugServ : public Module
     CommandMugReset     cmd_mugreset;
     CommandMugStats     cmd_mugstats;
     CommandMugHelp      cmd_help;
+    CommandMugEnable    cmd_enable;
+    CommandMugDisable   cmd_disable;
 
     MugSaveTimer        save_timer;
 
@@ -1623,6 +1734,7 @@ public:
         , cmd_use(this),       cmd_top5(this),      cmd_top10(this)
         , cmd_mugadd(this),    cmd_mugset(this),    cmd_mugtake(this)
         , cmd_mugreset(this),  cmd_mugstats(this),  cmd_help(this)
+        , cmd_enable(this),    cmd_disable(this)
         , save_timer()
     {
         s_module = this;
@@ -1645,7 +1757,21 @@ public:
             throw ConfigException(this->name + ": no service bot named \"" + cname + "\". "
                 "Add a 'service { nick = \"" + cname + "\"; ... }' block to services.conf.");
 
-        s_announce_chan = block->Get<Anope::string>("announce_channel", "");
+        // Parse channels from config (space-separated); DB-persisted channels are
+        // already in s_channels from load_db(), so we only add config ones here.
+        {
+            Anope::string ch_str = block->Get<Anope::string>("channels", "");
+            if (!ch_str.empty())
+            {
+                std::istringstream ss(ch_str.c_str());
+                std::string tok;
+                while (ss >> tok)
+                    s_channels.insert(Anope::string(tok).lower());
+            }
+        }
+
+        s_cmd_prefix = block->Get<Anope::string>("cmd_prefix", "!");
+        if (s_cmd_prefix.empty()) s_cmd_prefix = "!";
 
         // Parse admin_nicks (space-separated)
         s_admin_nicks.clear();
@@ -1684,6 +1810,121 @@ public:
         s_bot->SetCommand("MUGSTATS",  "mugserv/MUGSTATS");
         s_bot->SetCommand("HELP",      "mugserv/HELP");
         s_bot->SetCommand("COMMANDS",  "mugserv/HELP");
+        s_bot->SetCommand("ENABLE",    "mugserv/ENABLE");
+        s_bot->SetCommand("DISABLE",   "mugserv/DISABLE");
+
+        // Join all configured channels.
+        for (const auto &chan : s_channels)
+        {
+            Channel *c = Channel::Find(chan);
+            if (!c || !c->FindUser(s_bot))
+                s_bot->Join(chan);
+        }
+    }
+
+    // Intercept channel messages for !command triggers.
+    void OnMessage(MessageSource &source, Anope::string &target, Anope::string &msg) override
+    {
+        // Only channel messages to active channels.
+        if (target.empty() || target[0] != '#') return;
+        if (!s_channels.count(target.lower())) return;
+        if (!s_bot) return;
+        if (msg.length() <= s_cmd_prefix.length()) return;
+        if (msg.substr(0, s_cmd_prefix.length()) != s_cmd_prefix) return;
+
+        User *u = source.GetUser();
+        if (!u) return;
+
+        // Strip prefix; split verb and args.
+        Anope::string rest = msg.substr(s_cmd_prefix.length());
+        size_t sp = rest.find(' ');
+        Anope::string verb  = (sp == Anope::string::npos) ? rest : rest.substr(0, sp);
+        Anope::string argstr = (sp == Anope::string::npos) ? "" : rest.substr(sp + 1);
+        if (verb.empty()) return;
+
+        // Commands that must be used in PM only.
+        static const std::vector<Anope::string> pm_only = {
+            "shop", "buy", "inv", "inventory", "use",
+            "mugadd", "mugset", "mugtake", "mugreset", "mugstats",
+            "enable", "disable"
+        };
+        Anope::string lverb = verb.lower();
+        for (const auto &v : pm_only)
+        {
+            if (lverb == v)
+            {
+                s_bot->Say(target, u->GetNick() + ": Please \002/msg "
+                           + s_bot->GetNick() + " " + verb.upper()
+                           + (argstr.empty() ? "" : " " + argstr)
+                           + "\002 for that command.");
+                return;
+            }
+        }
+
+        // NickServ gate.
+        NickAlias *na = NickAlias::Find(u->GetNick());
+        if (!na || !na->nc)
+        {
+            s_bot->Say(target, u->GetNick()
+                + ": You must be identified with NickServ to play MugServ.");
+            return;
+        }
+
+        NickCore *nc = na->nc;
+        Anope::string acct_key = nc->display.lower();
+
+        // Auto-enroll.
+        if (!s_users.count(acct_key))
+        {
+            MugUser nu;
+            nu.account = acct_key;
+            nu.nick    = u->GetNick();
+            s_users[acct_key] = nu;
+            s_bot->Say(target, u->GetNick()
+                + ": Welcome to MugServ! You've been enrolled. Type "
+                + s_cmd_prefix + "help for commands.");
+        }
+        else
+        {
+            s_users[acct_key].nick = u->GetNick();
+        }
+
+        // Parse params.
+        std::vector<Anope::string> params;
+        if (!argstr.empty())
+        {
+            std::istringstream ss(argstr.c_str());
+            std::string tok;
+            while (ss >> tok)
+                params.push_back(Anope::string(tok));
+        }
+
+        // Resolve canonical verb name.
+        Anope::string svcmd = verb.upper();
+        if (svcmd == "ROB")       svcmd = "MUG";
+        if (svcmd == "BAL")       svcmd = "BALANCE";
+        if (svcmd == "INVENTORY") svcmd = "INV";
+        if (svcmd == "COMMANDS")  svcmd = "HELP";
+
+        BotInfo::command_map::iterator ci = s_bot->commands.find(svcmd);
+        if (ci == s_bot->commands.end()) return;
+
+        Command *cmd = Service::Find<Command>("Command", ci->second.name);
+        if (!cmd) return;
+
+        // Min params check.
+        if (static_cast<int>(params.size()) < cmd->min_params)
+        {
+            s_bot->Say(target, u->GetNick() + ": Usage: " + s_cmd_prefix
+                       + svcmd.lower() + " " + cmd->GetSyntax());
+            return;
+        }
+
+        // Set channel context so announce() routes to this channel.
+        s_current_chan = target.lower();
+        CommandSource fake_src(u->GetNick(), u, nc, nullptr, s_bot);
+        cmd->Execute(fake_src, params);
+        s_current_chan = "";
     }
 
     // Hook into Anope's periodic database save cycle.

@@ -1,11 +1,12 @@
 # MugServ — Anope IRC Services Economy Module
 
-A standalone IRC economy service for **Anope IRC Services 2.0**, ported from a Sopel IRC bot plugin. Players collect coins, mug each other, gamble, place bounties, and buy items from a crime shop — all via private messages to the `MugServ` bot.
+A standalone IRC economy service for **Anope IRC Services 2.0**, ported from a Sopel IRC bot plugin. Players collect coins, mug each other, gamble, place bounties, and buy items from a crime shop — either via channel commands or private messages to the `MugServ` bot.
 
 ---
 
 ## Features
 
+- **Channel-based interaction** — assign the bot to channels; users type `!coins`, `!mug Nick`, etc.
 - **Coin collection** with wealth-scaling rewards
 - **Mugging system** with success, fail, and critical fail outcomes
 - **Gambling** (`BET`)
@@ -16,7 +17,6 @@ A standalone IRC economy service for **Anope IRC Services 2.0**, ported from a S
 - **NickServ-gated access** — auto-enroll on first use, no manual registration
 - **Per-account data** — all grouped nicks under one NickServ account share one balance
 - **Flat-file database** — human-readable, saved every 5 minutes and on shutdown
-- **Announce channel** support — public results posted to a configured channel
 - **Admin commands** for IRCops and configured admins
 
 ---
@@ -75,9 +75,13 @@ ms_mugserv
     /* Name of the service bot defined above. Default: MugServ */
     client = "MugServ"
 
-    /* Channel to announce public mug/bet/bounty results.
-     * Leave unset to send results only to the user via PM. */
-    announce_channel = "#general"
+    /* Space-separated list of channels where the bot will join and listen
+     * for !command triggers. Leave empty for PM-only mode.
+     * Channels can also be added at runtime with ENABLE <#channel>. */
+    channels = "#general #gaming"
+
+    /* Prefix character used in channels. Default: ! */
+    cmd_prefix = "!"
 
     /* Space-separated list of nicks granted admin access to MugServ
      * admin commands. IRCops are always admins regardless of this list.
@@ -91,7 +95,8 @@ ms_mugserv
 | Option | Default | Description |
 |---|---|---|
 | `client` | `MugServ` | The service bot nick to bind commands to |
-| `announce_channel` | *(empty)* | Channel for public game output; omit for PM-only |
+| `channels` | *(empty)* | Space-separated channel list where bot is active |
+| `cmd_prefix` | `!` | Prefix character for channel commands |
 | `admin_nicks` | *(empty)* | Space-separated extra admin nicks (beyond IRCops) |
 
 ---
@@ -106,6 +111,7 @@ Data is stored in `<anope datadir>/mugserv.db` as a flat text file. It is:
 
 **Format:**
 ```
+CHANNEL <#channel>
 USER <account> <nick> <coins> <last_coins> <last_mug> <jail_until> <last_bet> <last_give> <last_bounty> <daily_given> <daily_reset> <inv0> <inv1> <inv2> <inv3> <inv4> <inv5> <inv6>
 BOUNTY <account_key> <amount>
 ```
@@ -126,9 +132,30 @@ Players are **automatically enrolled** the first time they successfully use any 
 
 ---
 
+## Channel Usage
+
+When the bot is active in a channel, users interact with it using a prefix (default `!`):
+
+```
+!coins
+!mug SomeNick
+!bet 500
+!bounty SomeNick 1000
+!top5
+!help
+```
+
+**Public commands** (COINS, MUG/ROB, BET, GIVE, BOUNTY, BOUNTIES, BALANCE, JAIL, TOP5, TOP10, HELP) — results are posted in the channel so everyone can see.
+
+**Private commands** (SHOP, BUY, INV, USE, and all admin commands) — the bot prompts you to `/msg MugServ` directly; responses are sent as a PM to keep the channel clean.
+
+You can always `/msg MugServ <COMMAND>` directly as well — both methods work simultaneously. When multiple channels are active and a command is used via PM, the result is broadcast to all active channels.
+
+---
+
 ## Player Commands
 
-All commands are sent via `/msg MugServ <COMMAND>`.
+Commands work both in active channels (prefix `!`) and via `/msg MugServ <COMMAND>`.
 
 ### Economy
 
@@ -214,7 +241,9 @@ Admin access is granted to **IRCops** and any nicks listed in `admin_nicks` in `
 | `MUGSET <nick> <amount>` | Set a player's balance to an exact amount. |
 | `MUGTAKE <nick> <amount>` | Remove coins from a player (floored at 0). |
 | `MUGRESET [confirm]` | **Destructive.** Resets all balances, inventories, cooldowns, and bounties to zero. Requires `confirm` argument to proceed. |
-| `MUGSTATS` | Economy overview: total players, active bounties, total coins in circulation, top 5 leaderboard, announce channel, DB path. |
+| `MUGSTATS` | Economy overview: total players, active bounties, total coins in circulation, top 5 leaderboard, active channels, DB path. |
+| `ENABLE <#channel>` | Add a channel (bot joins and starts listening). Persisted to DB. |
+| `DISABLE <#channel>` | Remove a channel (bot parts). Persisted to DB. |
 
 ---
 
@@ -273,6 +302,8 @@ The database is saved automatically on unload so no data is lost during a reload
 ## Notes
 
 - Player data is keyed to the **NickServ account name**, not the IRC nick. Nick changes and grouped nicks are transparent — the same account always has the same balance.
-- The `announce_channel` receives one line per mug/bet/give/bounty action. If not set, results go only to the involved players via PM.
+- When a command is triggered in a channel, public results (mug/bet/bounty/coins etc.) are posted to that channel. Private/shop commands are always sent via PM.
+- When a command is triggered via PM and channels are active, public results are broadcast to all active channels.
+- Active channels are persisted in the database so they survive module reloads. Channels listed in `services.conf` are merged with the saved list on startup.
 - There is no economy-wide inflation control; the admin `MUGSTATS` command shows total coins in circulation for manual oversight.
 - The Bail Bondsman is the only consumable item. All other items are permanent passive bonuses until the admin resets them.
