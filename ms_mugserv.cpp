@@ -99,6 +99,8 @@ static const int      BOUNTY_MIN_AMT    = 10;
 static const int64_t  BOUNTY_MAX_AMT    = 100000LL;
 static const int64_t  GIVE_DAILY_LIMIT  = 500000LL;
 static const int      GIVE_DAY_SECS     = 86400;
+static const int64_t  MAX_COINS         = 999999999999LL; // sanity cap
+static const int      GLOBAL_CMD_CD     = 3;  // seconds between any command per user
 
 // ===========================================================================
 // Item table  (index 0-6 maps to ITEM_KEYS[])
@@ -131,6 +133,15 @@ static const ItemDef ITEMS[7] =
 };
 
 static const int NUM_ITEMS = 7;
+
+// Named indices into ITEMS[] — keep in sync with the array above.
+static const int ITEM_MASK    = 0;
+static const int ITEM_KNUCKS  = 1;
+static const int ITEM_LUCKY   = 2;
+static const int ITEM_VEST    = 3;
+static const int ITEM_CLOAK   = 4;
+static const int ITEM_BANANA  = 5;
+static const int ITEM_BAIL    = 6;
 
 static int find_item(const Anope::string &key)
 {
@@ -166,7 +177,9 @@ static const T& rand_pick(const std::vector<T> &v)
 static Anope::string fmt_coins(int64_t n)
 {
     bool neg = n < 0;
-    uint64_t val = static_cast<uint64_t>(neg ? -n : n);
+    // Avoid UB when n == INT64_MIN: -(MIN+1) is safe, then +1 as unsigned.
+    uint64_t val = neg ? static_cast<uint64_t>(-(n + 1)) + 1u
+                       : static_cast<uint64_t>(n);
     std::string s = std::to_string(val);
     for (int p = static_cast<int>(s.size()) - 3; p > 0; p -= 3)
         s.insert(static_cast<size_t>(p), ",");
@@ -230,6 +243,8 @@ static Anope::string                          s_current_chan;
 static std::map<Anope::string, MugUser>       s_users;
 // nick.lower() → bounty pool
 static std::map<Anope::string, int64_t>       s_bounties;
+// Per-user global command throttle: account.lower() → last command time
+static std::map<Anope::string, time_t>        s_last_cmd;
 
 // ===========================================================================
 // Persistence helpers  (flat-file DB)
@@ -244,7 +259,10 @@ static void save_db()
 {
     std::ofstream f(db_path().c_str());
     if (!f.is_open())
+    {
+        Log(LOG_NORMAL) << "MugServ: failed to open " << db_path() << " for writing";
         return;
+    }
 
     f << "# MugServ database v1 — do not edit while service is running\n";
 
@@ -318,8 +336,18 @@ static void load_db()
             {
                 int v = 0;
                 ss >> v;
-                u.inv[i] = std::min(v, 3);  // cap at 3
+                u.inv[i] = std::max(0, std::min(v, 3));  // clamp [0,3]
             }
+            // Sanitise parsed values
+            u.coins       = std::max(int64_t(0), std::min(u.coins, MAX_COINS));
+            u.daily_given = std::max(int64_t(0), u.daily_given);
+            if (u.last_coins < 0)  u.last_coins = 0;
+            if (u.last_mug < 0)    u.last_mug = 0;
+            if (u.jail_until < 0)  u.jail_until = 0;
+            if (u.last_bet < 0)    u.last_bet = 0;
+            if (u.last_give < 0)   u.last_give = 0;
+            if (u.last_bounty < 0) u.last_bounty = 0;
+            if (u.daily_reset < 0) u.daily_reset = 0;
             if (!u.account.empty())
                 s_users[u.account] = u;
         }
@@ -328,7 +356,8 @@ static void load_db()
             std::string nick;
             int64_t amt = 0;
             ss >> nick >> amt;
-            s_bounties[Anope::string(nick).lower()] = amt;
+            if (amt > 0)
+                s_bounties[Anope::string(nick).lower()] = std::min(amt, MAX_COINS);
         }
     }
 }
@@ -349,35 +378,82 @@ static bool is_admin(CommandSource &src)
         return false;
     if (src.GetUser()->IsOper())
         return true;
-    Anope::string lnick = src.GetNick().lower();
+    // Require NickServ identification — compare account name, not display nick,
+    // to prevent privilege escalation via nick impersonation.
+    if (!src.nc)
+        return false;
+    Anope::string lacct = src.nc->display.lower();
     for (const Anope::string &an : s_admin_nicks)
-        if (lnick == an.lower())
+        if (lacct == an.lower())
             return true;
     return false;
+}
+
+// IRC safe message limit (conservative; accounts for nick!user@host prefix).
+static const size_t IRC_SAFE_MAX = 400;
+
+// Split a long message on " | " or space boundaries, yielding chunks that
+// fit within IRC_SAFE_MAX bytes.
+static std::vector<Anope::string> split_irc(const Anope::string &text)
+{
+    std::vector<Anope::string> chunks;
+    if (text.length() <= IRC_SAFE_MAX)
+    {
+        chunks.push_back(text);
+        return chunks;
+    }
+
+    Anope::string remaining = text;
+    while (remaining.length() > IRC_SAFE_MAX)
+    {
+        Anope::string candidate = remaining.substr(0, IRC_SAFE_MAX);
+        // Prefer splitting on " | " (leaderboard / balance style)
+        size_t cut = candidate.rfind(" | ");
+        if (cut == Anope::string::npos || cut < 20)
+            cut = candidate.rfind(' ');
+        if (cut == Anope::string::npos || cut < 20)
+            cut = IRC_SAFE_MAX;
+
+        chunks.push_back(remaining.substr(0, cut));
+        remaining = remaining.substr(cut);
+        // Trim leading separator
+        if (remaining.length() >= 3 && remaining.substr(0, 3) == " | ")
+            remaining = remaining.substr(3);
+        else if (!remaining.empty() && remaining[0] == ' ')
+            remaining = remaining.substr(1);
+    }
+    if (!remaining.empty())
+        chunks.push_back(remaining);
+    return chunks;
 }
 
 // Send a public message: if s_current_chan is set (channel-triggered command),
 // reply there; otherwise broadcast to all active channels (PM-triggered command).
 // Falls back to user PM if no channels are configured.
+// Long messages are automatically split to stay within IRC line limits.
 static void announce(CommandSource &src, const Anope::string &msg,
                      const Anope::string &chan = "")
 {
     // Prefer explicit channel arg, then s_current_chan, then broadcast/PM.
     const Anope::string &dest = !chan.empty() ? chan : s_current_chan;
     if (!s_bot) { src.Reply("%s", msg.c_str()); return; }
+
+    auto parts = split_irc(msg);
     if (!dest.empty())
     {
-        s_bot->Say(dest, msg);
+        for (const auto &p : parts)
+            s_bot->Say(dest, p);
     }
     else if (!s_channels.empty())
     {
-        // PM-triggered with no current channel: broadcast to all active channels.
         for (const auto &ch : s_channels)
-            s_bot->Say(ch, msg);
+            for (const auto &p : parts)
+                s_bot->Say(ch, p);
     }
     else
     {
-        src.Reply("%s", msg.c_str());
+        for (const auto &p : parts)
+            src.Reply("%s", p.c_str());
     }
 }
 
@@ -414,7 +490,8 @@ static Anope::string get_target_account_key(const Anope::string &target)
     return target.lower();
 }
 
-// Gate: require NickServ identification; auto-enroll on first use.
+// Gate: require NickServ identification; auto-enroll on first use;
+// enforce global per-user command throttle.
 // Returns true if the command should be blocked.
 static bool check_gate(CommandSource &src)
 {
@@ -424,7 +501,15 @@ static bool check_gate(CommandSource &src)
                 "Use: /msg NickServ IDENTIFY <password>");
         return true;
     }
+
+    // Global per-user command throttle (anti-spam).
     Anope::string key = src.nc->display.lower();
+    time_t now = Anope::CurTime;
+    auto &last = s_last_cmd[key];
+    if (now - last < GLOBAL_CMD_CD)
+        return true;   // silently drop rapid-fire commands
+    last = now;
+
     if (!s_users.count(key))
     {
         // First use — auto-enroll silently.
@@ -815,7 +900,10 @@ struct CommandMugMug : Command
             return;
         }
 
-        // ── Ultra-rare instant jail (before anything else) ─────────────────
+        // Deduct mug fee (before any outcome, including oops-jail)
+        att.coins -= MUG_FEE;
+
+        // ── Ultra-rare instant jail ────────────────────────────────────────
         if (ri(1, 100) <= OOPS_JAIL_CHANCE)
         {
             int64_t loss = std::min(att.coins, MAX_CRIT_LOSS);
@@ -834,9 +922,6 @@ struct CommandMugMug : Command
             return;
         }
 
-        // Deduct mug fee
-        att.coins -= MUG_FEE;
-
         // ── Roll ────────────────────────────────────────────────────────────
         int success_bonus = std::min(35, inv_sum(att, &ItemDef::mug_success_bonus));
         int eff_success   = std::min(95, SUCCESS_CHANCE + success_bonus);
@@ -849,7 +934,7 @@ struct CommandMugMug : Command
         {
             int64_t cur = att.coins;
             int pct = ri(CRIT_LOSS_MIN, CRIT_LOSS_MAX);
-            int64_t loss = std::min({static_cast<int64_t>(cur * pct / 100), cur, MAX_CRIT_LOSS});
+            int64_t loss = std::min({cur * pct / 100, cur, MAX_CRIT_LOSS});
             loss = std::max(loss, int64_t(0));
 
             att.coins    -= loss;
@@ -857,9 +942,9 @@ struct CommandMugMug : Command
             att.last_mug  = now;
 
             // Auto-bail
-            if (att.inv[6] > 0)  // [6] = bail
+            if (att.inv[ITEM_BAIL] > 0)
             {
-                att.inv[6]--;
+                att.inv[ITEM_BAIL]--;
                 att.jail_until = 0;
                 Anope::string msg = tpl(rand_pick(MSG_MUG_CRIT),
                     {{"att", att.nick}, {"loss", fmt_coins(loss)},
@@ -886,7 +971,7 @@ struct CommandMugMug : Command
         if (roll <= eff_success)
         {
             // Banana trap
-            int banana_count = vic->inv[5];  // [5] = banana
+            int banana_count = vic->inv[ITEM_BANANA];
             if (banana_count > 0)
             {
                 int slip = std::min(banana_count * BANANA_SLIP_PCT, BANANA_SLIP_MAX);
@@ -926,14 +1011,16 @@ struct CommandMugMug : Command
             bool mega = (ri(1, 100) <= MEGA_STEAL_CHANCE);
             if (mega) steal_pct += MEGA_STEAL_BONUS;
 
+            // Use capped value to avoid overflow on large balances.
+            int64_t capped_bal = std::min(vic->coins, MAX_COINS);
             int64_t steal_raw = std::max(int64_t(1),
-                                         static_cast<int64_t>(vic->coins * steal_pct / 100));
+                                         capped_bal * steal_pct / 100);
 
             bool whale_capped = false;
             if (vic->coins > RICH_THRESHOLD)
             {
                 int64_t rich_cap = std::max(int64_t(1),
-                                            vic->coins * RICH_MAX_STEAL / 100);
+                                            capped_bal * RICH_MAX_STEAL / 100);
                 if (steal_raw > rich_cap)
                 {
                     steal_raw   = rich_cap;
@@ -984,7 +1071,7 @@ struct CommandMugMug : Command
         if (roll <= eff_success + FAIL_CHANCE)
         {
             int pct = ri(FAIL_LOSS_MIN, FAIL_LOSS_MAX);
-            int64_t loss = std::min({static_cast<int64_t>(att.coins * pct / 100),
+            int64_t loss = std::min({att.coins * pct / 100,
                                      att.coins, MAX_FAIL_LOSS});
             loss = std::max(loss, int64_t(0));
             att.coins   -= loss;
@@ -1410,7 +1497,7 @@ struct CommandMugAdd : Command
             pm(src, "Access denied.");
             return;
         }
-        MugUser *u = get_user(params[0]);
+        MugUser *u = get_user_by_target(params[0]);
         if (!u)
         {
             pm(src, params[0] + " is not registered with MugServ.");
@@ -1437,7 +1524,7 @@ struct CommandMugSet : Command
     void Execute(CommandSource &src, const std::vector<Anope::string> &params) override
     {
         if (!is_admin(src)) { pm(src, "Access denied."); return; }
-        MugUser *u = get_user(params[0]);
+        MugUser *u = get_user_by_target(params[0]);
         if (!u) { pm(src, params[0] + " is not registered."); return; }
         int64_t amt = 0;
         try { amt = std::stoll(params[1].c_str()); } catch (...) {}
@@ -1459,7 +1546,7 @@ struct CommandMugTake : Command
     void Execute(CommandSource &src, const std::vector<Anope::string> &params) override
     {
         if (!is_admin(src)) { pm(src, "Access denied."); return; }
-        MugUser *u = get_user(params[0]);
+        MugUser *u = get_user_by_target(params[0]);
         if (!u) { pm(src, params[0] + " is not registered."); return; }
         int64_t amt = 0;
         try { amt = std::stoll(params[1].c_str()); } catch (...) {}
@@ -1842,23 +1929,20 @@ public:
         Anope::string argstr = (sp == Anope::string::npos) ? "" : rest.substr(sp + 1);
         if (verb.empty()) return;
 
-        // Commands that must be used in PM only.
-        static const std::vector<Anope::string> pm_only = {
+        // Commands that must be used in PM only (static to avoid rebuild per message).
+        static const std::set<Anope::string> pm_only = {
             "shop", "buy", "inv", "inventory", "use",
             "mugadd", "mugset", "mugtake", "mugreset", "mugstats",
             "enable", "disable"
         };
         Anope::string lverb = verb.lower();
-        for (const auto &v : pm_only)
+        if (pm_only.count(lverb))
         {
-            if (lverb == v)
-            {
-                s_bot->Say(target, u->GetNick() + ": Please \002/msg "
-                           + s_bot->GetNick() + " " + verb.upper()
-                           + (argstr.empty() ? "" : " " + argstr)
-                           + "\002 for that command.");
-                return;
-            }
+            s_bot->Say(target, u->GetNick() + ": Please \002/msg "
+                       + s_bot->GetNick() + " " + verb.upper()
+                       + (argstr.empty() ? "" : " " + argstr)
+                       + "\002 for that command.");
+            return;
         }
 
         // NickServ gate.
