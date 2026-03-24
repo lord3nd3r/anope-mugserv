@@ -23,8 +23,8 @@ A standalone IRC economy service for **Anope IRC Services 2.0**, ported from a S
 
 ## Requirements
 
-- Anope IRC Services **2.0.x**
-- A C++11 (or later) compiler
+- Anope IRC Services **2.0.x** (tested with 2.0.19)
+- A C++ compiler (C++03 or later; compatible with Anope's `-ansi -pedantic` build)
 - NickServ module loaded (standard in any Anope install)
 
 ---
