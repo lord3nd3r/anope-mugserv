@@ -869,7 +869,7 @@ static ModuleMugServ *s_module = NULL;
 class MugSaveTimer : public Timer
 {
 public:
-    MugSaveTimer(Module *mod) : Timer(mod, 300, Anope::CurTime, true) {}
+    MugSaveTimer(Module *mod) : Timer(mod, 30, Anope::CurTime, true) {}
     void Tick(time_t) anope_override { save_db(); }
 };
 
