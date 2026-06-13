@@ -2276,31 +2276,31 @@ struct CommandMugRoll : Command
 struct SlotPrize { int weight; long long payout; const char *reels; const char *msg; };
 
 static const SlotPrize PENNY_PRIZES[] = {
-    { 35, 0,    "--- --- ---", "Nothing. The machine laughs at you." },
-    { 20, 0,    "Lmn Chr ---", "Two fruits and a skull. Almost." },
-    { 12, 2,    "Chr Chr Lmn", "Two cherries! {coins} back." },
-    { 8,  5,    "Chr Chr Chr", "Triple cherries! +{coins}!" },
-    { 6,  15,   "Lmn Lmn Lmn", "Lemons! Sour but sweet -- +{coins}!" },
-    { 5,  50,   "BEL BEL BEL", "DING DING DING! +{coins}!" },
-    { 4,  150,  "DIA DIA BEL", "Diamonds and a bell! +{coins}!" },
-    { 3,  500,  "DIA DIA DIA", "TRIPLE DIAMONDS! +{coins}!" },
-    { 2,  1500, "FIR FIR FIR", "FIRE SPIN!!! +{coins}! The machine is SMOKING!" },
-    { 1,  5000, "777 777 777", "JACKPOT!!! +{coins}!!! THE CROWD GOES WILD!!!" },
+    { 35, 0,    "\xf0\x9f\x92\x80\xf0\x9f\x92\x80\xf0\x9f\x92\x80", "Nothing. The machine laughs at you." },
+    { 20, 0,    "\xf0\x9f\x8d\x8b\xf0\x9f\x8d\x92\xf0\x9f\x92\x80", "Two fruits and a skull. Almost." },
+    { 12, 2,    "\xf0\x9f\x8d\x92\xf0\x9f\x8d\x92\xf0\x9f\x8d\x8b", "Two cherries! {coins} back." },
+    { 8,  5,    "\xf0\x9f\x8d\x92\xf0\x9f\x8d\x92\xf0\x9f\x8d\x92", "Triple cherries! +{coins}!" },
+    { 6,  15,   "\xf0\x9f\x8d\x8b\xf0\x9f\x8d\x8b\xf0\x9f\x8d\x8b", "Lemons! Sour but sweet -- +{coins}!" },
+    { 5,  50,   "\xf0\x9f\x94\x94\xf0\x9f\x94\x94\xf0\x9f\x94\x94", "DING DING DING! +{coins}!" },
+    { 4,  150,  "\xf0\x9f\x92\x8e\xf0\x9f\x92\x8e\xf0\x9f\x94\x94", "Diamonds and a bell! +{coins}!" },
+    { 3,  500,  "\xf0\x9f\x92\x8e\xf0\x9f\x92\x8e\xf0\x9f\x92\x8e", "TRIPLE DIAMONDS! +{coins}!" },
+    { 2,  1500, "\xf0\x9f\x94\xa5\xf0\x9f\x94\xa5\xf0\x9f\x94\xa5", "FIRE SPIN!!! +{coins}! The machine is SMOKING!" },
+    { 1,  5000, "\xf0\x9f\x91\x91\xf0\x9f\x91\x91\xf0\x9f\x91\x91", "JACKPOT!!! +{coins}!!! THE CROWD GOES WILD!!!" },
 };
 static const int NUM_PENNY_PRIZES = 10;
 
 static const SlotPrize DOLLAR_PRIZES[] = {
-    { 30, 0,     "XXX XXX XXX", "Dead on arrival. The machine devours your dollar." },
-    { 18, 0,     "GRP ORG XXX", "Fruit salad of failure. Nothing." },
-    { 12, 50,    "ORG ORG GRP", "Two oranges! Partial refund -- {coins} back." },
-    { 9,  200,   "ORG ORG ORG", "Triple oranges! +{coins}!" },
-    { 7,  500,   "GRP GRP GRP", "Grapes! Wine money -- +{coins}!" },
-    { 6,  1500,  "MON MON GRP", "Two money bags! +{coins}!" },
-    { 5,  3000,  "MON MON MON", "TRIPLE MONEY BAGS! +{coins}!" },
-    { 4,  8000,  "STR STR MON", "Shooting stars! +{coins}!" },
-    { 3,  15000, "STR STR STR", "TRIPLE STARS! +{coins}! The machine is GLOWING!" },
-    { 2,  30000, "DIA FIR DIA", "INFERNO DIAMONDS! +{coins}! Security is on their way!" },
-    { 1,  50000, "JKP JKP JKP", "MEGA JACKPOT!!! +{coins}!!! THE FLOOR ERUPTS!!!" },
+    { 30, 0,     "\xe2\x98\xa0\xef\xb8\x8f\xe2\x98\xa0\xef\xb8\x8f\xe2\x98\xa0\xef\xb8\x8f", "Dead on arrival. The machine devours your dollar." },
+    { 18, 0,     "\xf0\x9f\x8d\x87\xf0\x9f\x8d\x8a\xe2\x98\xa0\xef\xb8\x8f", "Fruit salad of failure. Nothing." },
+    { 12, 50,    "\xf0\x9f\x8d\x8a\xf0\x9f\x8d\x8a\xf0\x9f\x8d\x87", "Two oranges! Partial refund -- {coins} back." },
+    { 9,  200,   "\xf0\x9f\x8d\x8a\xf0\x9f\x8d\x8a\xf0\x9f\x8d\x8a", "Triple oranges! +{coins}!" },
+    { 7,  500,   "\xf0\x9f\x8d\x87\xf0\x9f\x8d\x87\xf0\x9f\x8d\x87", "Grapes! Wine money -- +{coins}!" },
+    { 6,  1500,  "\xf0\x9f\x92\xb0\xf0\x9f\x92\xb0\xf0\x9f\x8d\x87", "Two money bags! +{coins}!" },
+    { 5,  3000,  "\xf0\x9f\x92\xb0\xf0\x9f\x92\xb0\xf0\x9f\x92\xb0", "TRIPLE MONEY BAGS! +{coins}!" },
+    { 4,  8000,  "\xf0\x9f\x8c\x9f\xf0\x9f\x8c\x9f\xf0\x9f\x92\xb0", "Shooting stars! +{coins}!" },
+    { 3,  15000, "\xf0\x9f\x8c\x9f\xf0\x9f\x8c\x9f\xf0\x9f\x8c\x9f", "TRIPLE STARS! +{coins}! The machine is GLOWING!" },
+    { 2,  30000, "\xf0\x9f\x92\x8e\xf0\x9f\x94\xa5\xf0\x9f\x92\x8e", "INFERNO DIAMONDS! +{coins}! Security is on their way!" },
+    { 1,  50000, "\xf0\x9f\x8f\x86\xf0\x9f\x8f\x86\xf0\x9f\x8f\x86", "MEGA JACKPOT!!! +{coins}!!! THE FLOOR ERUPTS!!!" },
 };
 static const int NUM_DOLLAR_PRIZES = 11;
 
