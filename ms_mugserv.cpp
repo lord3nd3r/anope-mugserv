@@ -940,7 +940,7 @@ struct CommandMugBalance : Command
             u = get_user(src.nc->display.lower());
             if (!u)
             {
-                pm(src, "You don't have a MugServ account yet. Use any command to get started!");
+                announce(src, "You don't have a MugServ account yet. Use any command to get started!");
                 return;
             }
         }
@@ -949,11 +949,11 @@ struct CommandMugBalance : Command
             u = get_user_by_target(params[0]);
             if (!u)
             {
-                pm(src, params[0] + " has no MugServ account.");
+                announce(src, params[0] + " has no MugServ account.");
                 return;
             }
         }
-        pm(src, "\002" + u->nick + "\002 has \002" + fmt_coins(u->coins) + "\002 coins.");
+        announce(src, "\002" + u->nick + "\002 has \002" + fmt_coins(u->coins) + "\002 coins.");
     }
 };
 
