@@ -1982,36 +1982,6 @@ struct CommandMugDisable : Command
     }
 };
 
-// ---- Admin: DISABLE ----
-struct CommandMugDisable : Command
-{
-    CommandMugDisable(Module *c) : Command(c, "mugserv/DISABLE", 1, 1)
-    {
-        SetDesc("[Admin] Disable MugServ in a channel");
-        SetSyntax("<#channel>");
-    }
-
-    void Execute(CommandSource &src, const std::vector<Anope::string> &params) anope_override
-    {
-        if (!is_admin(src)) { pm(src, "Access denied."); return; }
-        Anope::string chan = params[0].lower();
-        if (!s_channels.count(chan))
-        {
-            pm(src, chan + " is not in the active channel list.");
-            return;
-        }
-        s_channels.erase(chan);
-        if (s_bot)
-        {
-            Channel *c = Channel::Find(chan);
-            if (c && c->FindUser(s_bot))
-                s_bot->Part(c);
-        }
-        save_db();
-        pm(src, "MugServ disabled in " + chan + ".");
-    }
-};
-
 // ---- MUGTOGGLE ----
 struct CommandMugToggle : Command
 {
@@ -2238,12 +2208,12 @@ struct CommandMugRoll : Command
         long long amount = parse_ll(params[0]);
         if (amount < 1) { pm(src, "Amount must be >= 1."); return; }
 
-        Anope::string type = (params.size() > 1) ? params[1].lower() : Anope::string("high");
+        Anope::string dice_type = (params.size() > 1) ? params[1].lower() : Anope::string("high");
 
         // Validate type
         bool valid = false;
         for (int i = 0; i < NUM_DICE_GAMES; ++i)
-            if (type == DICE_GAMES[i].key) { valid = true; break; }
+            if (dice_type == DICE_GAMES[i].key) { valid = true; break; }
         if (!valid) { pm(src, "Unknown dice type. Options: high, lucky7, snake, field, hardway, yolo"); return; }
 
         int rem = cd_rem(u.last_bet, CD_BET);
@@ -2262,12 +2232,12 @@ struct CommandMugRoll : Command
         if (_has_godmode(src.nc->display))
         {
             // Rig for a win
-            if (type == "snake")        { d1=1; d2=1; }
-            else if (type == "lucky7")  { d1=3; d2=4; }
-            else if (type == "hardway") { d1=3; d2=3; }
-            else if (type == "yolo")    { d1=6; d2=6; }
-            else if (type == "field")   { d1=6; d2=6; }
-            else                        { d1=4; d2=4; }  // high: total 8
+            if (dice_type == "snake")        { d1=1; d2=1; }
+            else if (dice_type == "lucky7")  { d1=3; d2=4; }
+            else if (dice_type == "hardway") { d1=3; d2=3; }
+            else if (dice_type == "yolo")    { d1=6; d2=6; }
+            else if (dice_type == "field")   { d1=6; d2=6; }
+            else                             { d1=4; d2=4; }  // high: total 8
         }
         else
         {
@@ -2275,7 +2245,7 @@ struct CommandMugRoll : Command
         }
 
         bool won; long long payout; Anope::string flavor;
-        eval_dice(type, d1, d2, amount, won, payout, flavor);
+        eval_dice(dice_type, d1, d2, amount, won, payout, flavor);
 
         Anope::string f1 = (d1 >= 1 && d1 <= 6) ? Anope::string(DICE_FACES[d1]) : stringify(d1);
         Anope::string f2 = (d2 >= 1 && d2 <= 6) ? Anope::string(DICE_FACES[d2]) : stringify(d2);
@@ -2286,14 +2256,14 @@ struct CommandMugRoll : Command
             _update_highscore(u);
             announce(src, "\002ROLL\002 " + f1 + f2 + " " + u.nick
                 + " rolls " + stringify(d1) + "+" + stringify(d2) + "=" + stringify(d1+d2)
-                + " on " + type + "! " + flavor
+                + " on " + dice_type + "! " + flavor
                 + " Payout: " + fmt_coins(payout) + ". Balance: \002" + fmt_coins(u.coins) + "\002");
         }
         else
         {
             announce(src, "\002ROLL\002 " + f1 + f2 + " " + u.nick
                 + " rolls " + stringify(d1) + "+" + stringify(d2) + "=" + stringify(d1+d2)
-                + " on " + type + ". " + flavor
+                + " on " + dice_type + ". " + flavor
                 + " Lost " + fmt_coins(amount) + ". Balance: \002" + fmt_coins(u.coins) + "\002");
         }
     }
@@ -2578,26 +2548,26 @@ struct CommandMugRoulette : Command
             number = ri(0, 36);
         }
 
-        bool won; int mult; Anope::string desc;
-        roulette_eval(bet_str, number, won, mult, desc);
+        bool r_won; int r_mult; Anope::string r_desc;
+        roulette_eval(bet_str, number, r_won, r_mult, r_desc);
 
         Anope::string col = roulette_color(number);
         Anope::string col_tag = (col=="red") ? "\002RED\002" : (col=="black") ? "\002BLACK\002" : "\002GREEN\002";
 
-        if (won)
+        if (r_won)
         {
-            long long payout = amount * static_cast<long long>(mult);
+            long long payout = amount * static_cast<long long>(r_mult);
             u.coins += payout;
             _update_highscore(u);
             announce(src, "\002ROULETTE\002 " + col_tag + " " + stringify(number)
-                + " | " + u.nick + " bet " + desc + " -- \002WIN!\002 "
-                + "Payout: " + fmt_coins(payout) + " (" + stringify(mult) + "x). "
+                + " | " + u.nick + " bet " + r_desc + " -- \002WIN!\002 "
+                + "Payout: " + fmt_coins(payout) + " (" + stringify(r_mult) + "x). "
                 + "Balance: \002" + fmt_coins(u.coins) + "\002");
         }
         else
         {
             announce(src, "\002ROULETTE\002 " + col_tag + " " + stringify(number)
-                + " | " + u.nick + " bet " + desc + " -- nope. "
+                + " | " + u.nick + " bet " + r_desc + " -- nope. "
                 + "Lost " + fmt_coins(amount) + ". Balance: \002" + fmt_coins(u.coins) + "\002");
         }
     }
