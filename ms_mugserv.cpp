@@ -102,6 +102,26 @@ static const int      GIVE_DAY_SECS     = 86400;
 static const long long MAX_COINS        = 999999999999LL; // sanity cap
 static const int      GLOBAL_CMD_CD     = 3;  // seconds between any command per user
 
+// Dynamic mug fee: max(MUG_FEE, MUG_FEE_PCT% of attacker balance)
+static const double   MUG_FEE_PCT       = 0.1; // 0.1% of attacker balance
+// Attacker must have >= MUG_MIN_BAL_PCT% of victim's coins (skip if victim <= FLOOR)
+static const int      MUG_MIN_BAL_PCT   = 1;
+static const int      MUG_MIN_BAL_FLOOR = 100;
+
+// Slot machine cooldowns
+static const int      PENNY_COOLDOWN    = 15;
+static const int      PENNY_COST        = 1;
+static const int      DOLLAR_COOLDOWN   = 30;
+static const int      DOLLAR_COST       = 100;
+
+// Per-user cooldown for top5/top10
+static const int      TOP_CD            = 600;
+
+// Flood / spam gate
+static const int      FLOOD_WINDOW      = 60;    // rolling window in seconds
+static const int      FLOOD_MAX_CMDS    = 15;    // max commands before lockout
+static const int      FLOOD_LOCKOUT_DUR = 1800;  // 30-minute lockout
+
 // ===========================================================================
 // Item table  (index 0-6 maps to ITEM_KEYS[])
 // ===========================================================================
@@ -268,6 +288,34 @@ static std::map<Anope::string, long long>     s_bounties;
 // Per-user global command throttle: account.lower() -> last command time
 static std::map<Anope::string, time_t>        s_last_cmd;
 
+// Per-channel enable/disable toggles: chan.lower() -> enabled bool
+static std::map<Anope::string, bool>          s_channel_toggles;
+// God mode set: account.lower() in set = near-guaranteed luck
+static std::set<Anope::string>                s_godmode;
+// Flood tracking: account.lower() -> list of command timestamps
+static std::map<Anope::string, std::vector<time_t> > s_flood_history;
+// Flood lockout expiry: account.lower() -> expiry time
+static std::map<Anope::string, time_t>        s_flood_lockout;
+// Per-user top5/top10 cooldown
+static std::map<Anope::string, time_t>        s_top_cd;
+// All-time highscore
+static Anope::string                          s_highscore_nick;
+static long long                              s_highscore_amount = 0;
+
+// Blackjack per-player hand state
+struct BJHand
+{
+    struct Card { Anope::string rank; Anope::string suit; };
+    std::vector<Card> hand;
+    std::vector<Card> dealer;
+    std::vector<Card> deck;
+    long long amount;
+    Anope::string channel;
+    bool doubled;
+    BJHand() : amount(0), doubled(false) {}
+};
+static std::map<Anope::string, BJHand> s_bj_hands;
+
 // ===========================================================================
 // Persistence helpers  (flat-file DB)
 // ===========================================================================
@@ -290,6 +338,12 @@ static void save_db()
 
     for (std::set<Anope::string>::const_iterator it = s_channels.begin(); it != s_channels.end(); ++it)
         f << "CHANNEL " << it->c_str() << "\n";
+
+    for (std::map<Anope::string, bool>::const_iterator it = s_channel_toggles.begin(); it != s_channel_toggles.end(); ++it)
+        f << "CHANTOGGLE " << it->first.c_str() << " " << (it->second ? "1" : "0") << "\n";
+
+    if (!s_highscore_nick.empty() && s_highscore_amount > 0)
+        f << "HIGHSCORE " << s_highscore_nick.c_str() << " " << s_highscore_amount << "\n";
 
     for (std::map<Anope::string, MugUser>::const_iterator it = s_users.begin(); it != s_users.end(); ++it)
     {
@@ -371,6 +425,25 @@ static void load_db()
             if (u.daily_reset < 0) u.daily_reset = 0;
             if (!u.account.empty())
                 s_users[u.account] = u;
+        }
+        else if (tag == "CHANTOGGLE")
+        {
+            std::string ch;
+            int en = 1;
+            ss >> ch >> en;
+            if (!ch.empty())
+                s_channel_toggles[Anope::string(ch).lower()] = (en != 0);
+        }
+        else if (tag == "HIGHSCORE")
+        {
+            std::string hn;
+            long long ha = 0;
+            ss >> hn >> ha;
+            if (!hn.empty() && ha > 0)
+            {
+                s_highscore_nick   = Anope::string(hn);
+                s_highscore_amount = ha;
+            }
         }
         else if (tag == "BOUNTY")
         {
@@ -706,6 +779,82 @@ static long long min3(long long a, long long b, long long c)
     if (b < m) m = b;
     if (c < m) m = c;
     return m;
+}
+
+// ===========================================================================
+// Toggle / godmode / flood helpers
+// ===========================================================================
+
+// Is the game enabled for a channel? Missing key = enabled (legacy compat).
+// Pass "" for PM-only context (always allowed).
+static bool _plugin_enabled(const Anope::string &chan)
+{
+    if (chan.empty()) return true;
+    std::map<Anope::string, bool>::const_iterator it = s_channel_toggles.find(chan.lower());
+    if (it == s_channel_toggles.end()) return true; // default: enabled
+    return it->second;
+}
+
+static void _set_channel_enabled(const Anope::string &chan, bool on)
+{
+    s_channel_toggles[chan.lower()] = on;
+    save_db();
+}
+
+static bool _has_godmode(const Anope::string &acct)
+{
+    return s_godmode.count(acct.lower()) > 0;
+}
+
+// Returns true if blocked (flood lockout active or just triggered).
+static bool _flood_check(CommandSource &src)
+{
+    if (!src.nc) return false;
+    Anope::string key = src.nc->display.lower();
+    if (is_admin(src)) return false;
+    time_t now = Anope::CurTime;
+    // Already locked out?
+    std::map<Anope::string, time_t>::iterator li = s_flood_lockout.find(key);
+    if (li != s_flood_lockout.end() && now < li->second)
+    {
+        int rem = static_cast<int>(li->second - now);
+        pm(src, "You are on a 30-minute lockout for spamming. " + fmt_dur(rem) + " remaining.");
+        return true;
+    }
+    // Record this command
+    std::vector<time_t> &hist = s_flood_history[key];
+    hist.push_back(now);
+    // Prune old entries outside window
+    time_t cutoff = now - static_cast<time_t>(FLOOD_WINDOW);
+    std::vector<time_t> fresh;
+    for (size_t i = 0; i < hist.size(); ++i)
+        if (hist[i] > cutoff) fresh.push_back(hist[i]);
+    hist = fresh;
+    if (static_cast<int>(hist.size()) > FLOOD_MAX_CMDS)
+    {
+        s_flood_lockout[key] = now + static_cast<time_t>(FLOOD_LOCKOUT_DUR);
+        hist.clear();
+        pm(src, "Slow down! You have been locked out of all casino commands for 30 minutes.");
+        return true;
+    }
+    return false;
+}
+
+static void _flood_clear(const Anope::string &acct)
+{
+    Anope::string key = acct.lower();
+    s_flood_lockout.erase(key);
+    s_flood_history.erase(key);
+}
+
+// Update all-time highscore after any balance change.
+static void _update_highscore(const MugUser &u)
+{
+    if (u.coins > s_highscore_amount)
+    {
+        s_highscore_amount = u.coins;
+        s_highscore_nick   = u.nick;
+    }
 }
 
 // ===========================================================================
@@ -1719,6 +1868,13 @@ struct CommandMugHelp : Command
         pm(src, "");
         pm(src, "\002Gambling\002");
         pm(src, "  BET <amount>          -- 40% chance to double your bet (Lucky Coin improves odds)");
+        pm(src, "  ROLL <amt> [type]     -- Dice casino. Types: high(2x) lucky7(4x) snake(30x) field(3x) hardway(8x) yolo(15x)");
+        pm(src, "  PENNY                 -- Penny slot: 1 coin per pull, win up to 5,000! (15s CD)");
+        pm(src, "  DOLLAR                -- Dollar slot: 100 coins per pull, win up to 50,000! (30s CD)");
+        pm(src, "  ROULETTE <amt> <bet>  -- Roulette. Bets: red/black/odd/even/high/low (2x), 1st/2nd/3rd (3x), 0-36 (36x)");
+        pm(src, "  BJ <amount>           -- Blackjack vs dealer. Then: HIT, STAND, DD (double down). BJ pays 2.5x");
+        pm(src, "  HOLDEM <amount>       -- Texas Hold'em vs dealer. Pair 2x ... Royal Flush 50x");
+        pm(src, "  Spam guard: 15+ commands in 60s = 30-min lockout");
         pm(src, "");
         pm(src, "\002Shop & Inventory\002");
         pm(src, "  SHOP                  -- Browse available items");
@@ -1740,13 +1896,17 @@ struct CommandMugHelp : Command
         pm(src, "  TOP10                 -- Top 10 richest players");
         pm(src, "");
         pm(src, "\002Admin (IRCops and configured admin_nicks only)\002");
-        pm(src, "  MUGADD <nick> <amt>   -- Add coins");
-        pm(src, "  MUGSET <nick> <amt>   -- Set balance");
-        pm(src, "  MUGTAKE <nick> <amt>  -- Remove coins");
-        pm(src, "  MUGRESET [confirm]    -- Reset ALL data");
-        pm(src, "  MUGSTATS              -- Economy overview");
-        pm(src, "  ENABLE <#channel>     -- Add a channel (bot joins + listens)");
-        pm(src, "  DISABLE <#channel>    -- Remove a channel");
+        pm(src, "  MUGADD <nick> <amt>     -- Add coins");
+        pm(src, "  MUGSET <nick> <amt>     -- Set balance");
+        pm(src, "  MUGTAKE <nick> <amt>    -- Remove coins");
+        pm(src, "  MUGRESET [confirm]      -- Reset ALL data");
+        pm(src, "  MUGSTATS               -- Economy overview");
+        pm(src, "  ENABLE <#channel>       -- Add a channel (bot joins + listens)");
+        pm(src, "  DISABLE <#channel>      -- Remove a channel");
+        pm(src, "  MUGTOGGLE [#ch] [on|off] -- Per-channel enable/disable toggle");
+        pm(src, "  GODMODE [on|off] [nick] -- Toggle 99% luck (PM only)");
+        pm(src, "  UNCOOLDOWN <nick>       -- Clear flood lockout (PM only)");
+        pm(src, "  HIGHSCORE              -- Show all-time high balance");
         pm(src, "");
         pm(src, "\002Channel Usage\002");
         pm(src, "  In any active channel, prefix commands with \002" + s_cmd_prefix + "\002:");
@@ -1822,48 +1982,1206 @@ struct CommandMugDisable : Command
     }
 };
 
+// ---- Admin: DISABLE ----
+struct CommandMugDisable : Command
+{
+    CommandMugDisable(Module *c) : Command(c, "mugserv/DISABLE", 1, 1)
+    {
+        SetDesc("[Admin] Disable MugServ in a channel");
+        SetSyntax("<#channel>");
+    }
+
+    void Execute(CommandSource &src, const std::vector<Anope::string> &params) anope_override
+    {
+        if (!is_admin(src)) { pm(src, "Access denied."); return; }
+        Anope::string chan = params[0].lower();
+        if (!s_channels.count(chan))
+        {
+            pm(src, chan + " is not in the active channel list.");
+            return;
+        }
+        s_channels.erase(chan);
+        if (s_bot)
+        {
+            Channel *c = Channel::Find(chan);
+            if (c && c->FindUser(s_bot))
+                s_bot->Part(c);
+        }
+        save_db();
+        pm(src, "MugServ disabled in " + chan + ".");
+    }
+};
+
+// ---- MUGTOGGLE ----
+struct CommandMugToggle : Command
+{
+    CommandMugToggle(Module *c) : Command(c, "mugserv/MUGTOGGLE", 0, 2)
+    {
+        SetDesc("[Admin] Enable/disable MugServ in a channel");
+        SetSyntax("[#channel] [on|off]");
+    }
+
+    void Execute(CommandSource &src, const std::vector<Anope::string> &params) anope_override
+    {
+        if (!is_admin(src)) { pm(src, "Access denied."); return; }
+
+        // Determine channel and action from params
+        Anope::string chan;
+        Anope::string action;
+        if (!params.empty() && !params[0].empty() && params[0][0] == '#')
+        {
+            chan = params[0].lower();
+            if (params.size() > 1) action = params[1].lower();
+        }
+        else if (!params.empty())
+        {
+            action = params[0].lower();
+        }
+
+        // If no channel given, use current context channel
+        if (chan.empty() && !s_current_chan.empty())
+            chan = s_current_chan;
+
+        if (chan.empty())
+        {
+            // Show all statuses
+            pm(src, "Usage: MUGTOGGLE [#channel] [on|off]");
+            if (s_channel_toggles.empty())
+            {
+                pm(src, "  All channels: ENABLED (default)");
+            }
+            else
+            {
+                for (std::map<Anope::string, bool>::const_iterator it = s_channel_toggles.begin();
+                     it != s_channel_toggles.end(); ++it)
+                    pm(src, "  " + it->first + ": " + (it->second ? "ENABLED" : "DISABLED"));
+            }
+            return;
+        }
+
+        if (action == "on" || action == "enable" || action == "true" || action == "1")
+        {
+            _set_channel_enabled(chan, true);
+            // Also join if not in channel
+            if (s_bot)
+            {
+                Channel *c = Channel::Find(chan);
+                if (!c || !c->FindUser(s_bot))
+                    s_bot->Join(chan);
+            }
+            pm(src, "Mug game ENABLED in " + chan + ". Let the chaos begin.");
+        }
+        else if (action == "off" || action == "disable" || action == "false" || action == "0")
+        {
+            _set_channel_enabled(chan, false);
+            pm(src, "Mug game DISABLED in " + chan + ". All gameplay commands paused.");
+        }
+        else
+        {
+            bool cur = _plugin_enabled(chan);
+            pm(src, "Mug game in " + chan + ": " + (cur ? "ENABLED" : "DISABLED"));
+            pm(src, "Usage: MUGTOGGLE [#channel] [on|off]");
+        }
+    }
+};
+
+// ---- GODMODE ----
+struct CommandMugGodMode : Command
+{
+    CommandMugGodMode(Module *c) : Command(c, "mugserv/GODMODE", 0, 2)
+    {
+        SetDesc("[Admin] Toggle near-guaranteed luck for a player");
+        SetSyntax("[on|off] [nick]");
+    }
+
+    void Execute(CommandSource &src, const std::vector<Anope::string> &params) anope_override
+    {
+        if (!is_admin(src)) { pm(src, "Access denied."); return; }
+
+        if (params.empty())
+        {
+            // Show status
+            Anope::string self = src.nc ? src.nc->display.lower() : "";
+            pm(src, "God mode for " + src.GetNick() + ": " +
+                    (_has_godmode(self) ? "ON" : "OFF"));
+            if (!s_godmode.empty())
+            {
+                Anope::string lst;
+                for (std::set<Anope::string>::const_iterator it = s_godmode.begin();
+                     it != s_godmode.end(); ++it)
+                {
+                    if (!lst.empty()) lst += ", ";
+                    lst += *it;
+                }
+                pm(src, "Currently enabled: " + lst);
+            }
+            return;
+        }
+
+        Anope::string action = params[0].lower();
+        Anope::string target = (params.size() > 1) ? params[1] : src.GetNick();
+        Anope::string tkey = target.lower();
+
+        if (action == "on" || action == "enable" || action == "true" || action == "1")
+        {
+            s_godmode.insert(tkey);
+            pm(src, "God mode ENABLED for " + target + ". 99% luck on everything.");
+        }
+        else if (action == "off" || action == "disable" || action == "false" || action == "0")
+        {
+            s_godmode.erase(tkey);
+            pm(src, "God mode DISABLED for " + target + ". Back to mortal luck.");
+        }
+        else
+        {
+            pm(src, "Usage: GODMODE [on|off] [nick]");
+        }
+    }
+};
+
+// ---- UNCOOLDOWN ----
+struct CommandMugUncooldown : Command
+{
+    CommandMugUncooldown(Module *c) : Command(c, "mugserv/UNCOOLDOWN", 1, 1)
+    {
+        SetDesc("[Admin] Clear a player's flood lockout");
+        SetSyntax("<nick>");
+    }
+
+    void Execute(CommandSource &src, const std::vector<Anope::string> &params) anope_override
+    {
+        if (!is_admin(src)) { pm(src, "Access denied."); return; }
+        Anope::string acct = params[0];
+        NickAlias *na = NickAlias::Find(acct);
+        if (na && na->nc) acct = na->nc->display;
+        _flood_clear(acct);
+        pm(src, "Flood lockout cleared for " + params[0] + ".");
+    }
+};
+
+// ---- HIGHSCORE ----
+struct CommandMugHighScore : Command
+{
+    CommandMugHighScore(Module *c) : Command(c, "mugserv/HIGHSCORE", 0, 0)
+    {
+        SetDesc("Show the all-time highest balance ever achieved");
+    }
+
+    void Execute(CommandSource &src, const std::vector<Anope::string> &) anope_override
+    {
+        if (s_highscore_nick.empty() || s_highscore_amount <= 0)
+        {
+            pm(src, "No high score recorded yet. Go earn some coins!");
+            return;
+        }
+        announce(src, "All-time high score: \002" + s_highscore_nick + "\002 with \002"
+                       + fmt_coins(s_highscore_amount) + "\002 coins!");
+    }
+};
+
+// ===========================================================================
+// Dice casino helpers
+// ===========================================================================
+
+struct DiceGame { const char *key, *desc, *payout; };
+static const DiceGame DICE_GAMES[] = {
+    { "high",    "Roll 2d6 -- 7+ wins",           "2x"  },
+    { "lucky7",  "Roll exactly 7",                "4x"  },
+    { "snake",   "Roll snake eyes (1+1)",          "30x" },
+    { "field",   "Roll 2,3,4,9,10,11,12 wins",    "2x (3x on 2/12)" },
+    { "hardway", "Roll doubles (not snake eyes)",  "8x"  },
+    { "yolo",    "Roll 2 or 12",                   "15x" },
+};
+static const int NUM_DICE_GAMES = 6;
+
+static const char *DICE_FACES[] = { "", "\xe2\x9a\x80", "\xe2\x9a\x81", "\xe2\x9a\x82",
+                                       "\xe2\x9a\x83", "\xe2\x9a\x84", "\xe2\x9a\x85" };
+
+static bool eval_dice(const Anope::string &type, int d1, int d2,
+                      long long amount, bool &won, long long &payout, Anope::string &flavor)
+{
+    int total = d1 + d2;
+    if (type == "high")    { won = total >= 7;              payout = won ? amount*2  : 0; flavor = "Total " + stringify(total) + (won ? " -- winner!" : " -- under 7."); }
+    else if (type == "lucky7")  { won = total == 7;         payout = won ? amount*4  : 0; flavor = won ? "Lucky 7!" : "Total " + stringify(total) + " -- needed 7."; }
+    else if (type == "snake")   { won = d1==1 && d2==1;     payout = won ? amount*30 : 0; flavor = won ? "SNAKE EYES! Legendary!" : "No snakes here."; }
+    else if (type == "field")   { static const int fn[] = {2,3,4,9,10,11,12}; bool inf=false; for(int i=0;i<7;i++) if(total==fn[i]){inf=true;break;} won=inf; int mult=(total==2||total==12)?3:2; payout=won?amount*mult:0; flavor=won?("Field "+stringify(total)+"! "+(mult==3?"Triple!":"Double!")):"Total "+stringify(total)+" -- not in the field."; }
+    else if (type == "hardway") { won = d1==d2 && !(d1==1&&d2==1); payout = won ? amount*8 : 0; flavor = won ? "Hard " + stringify(total) + "! Doubles pay fat!" : "No doubles."; }
+    else if (type == "yolo")    { won = total==2||total==12; payout = won ? amount*15 : 0; flavor = won ? "YOLO PAYS!" : "YOLO didn't pay this time."; }
+    else return false;
+    return true;
+}
+
+// ---- ROLL ----
+struct CommandMugRoll : Command
+{
+    CommandMugRoll(Module *c) : Command(c, "mugserv/ROLL", 1, 2)
+    {
+        SetDesc("Roll the dice casino");
+        SetSyntax("<amount> [high|lucky7|snake|field|hardway|yolo]");
+    }
+
+    void Execute(CommandSource &src, const std::vector<Anope::string> &params) anope_override
+    {
+        if (check_gate(src)) return;
+        if (_flood_check(src)) return;
+        MugUser &u = s_users[src.nc->display.lower()];
+
+        if (params.empty() || params[0].lower() == "help")
+        {
+            pm(src, "ROLL <amount> [type] -- Dice casino. Types:");
+            for (int i = 0; i < NUM_DICE_GAMES; ++i)
+                pm(src, "  " + Anope::string(DICE_GAMES[i].key) + " -- "
+                        + Anope::string(DICE_GAMES[i].desc) + " -> " + Anope::string(DICE_GAMES[i].payout));
+            return;
+        }
+
+        long long amount = parse_ll(params[0]);
+        if (amount < 1) { pm(src, "Amount must be >= 1."); return; }
+
+        Anope::string type = (params.size() > 1) ? params[1].lower() : Anope::string("high");
+
+        // Validate type
+        bool valid = false;
+        for (int i = 0; i < NUM_DICE_GAMES; ++i)
+            if (type == DICE_GAMES[i].key) { valid = true; break; }
+        if (!valid) { pm(src, "Unknown dice type. Options: high, lucky7, snake, field, hardway, yolo"); return; }
+
+        int rem = cd_rem(u.last_bet, CD_BET);
+        if (rem > 0 && !is_admin(src))
+        {
+            pm(src, tpl(rand_pick_str(s_msg_bet_cd), mkv1("t", fmt_dur(rem))));
+            return;
+        }
+
+        if (u.coins < amount) { pm(src, rand_pick_str(s_msg_broke)); return; }
+
+        u.coins   -= amount;
+        u.last_bet = Anope::CurTime;
+
+        int d1, d2;
+        if (_has_godmode(src.nc->display))
+        {
+            // Rig for a win
+            if (type == "snake")        { d1=1; d2=1; }
+            else if (type == "lucky7")  { d1=3; d2=4; }
+            else if (type == "hardway") { d1=3; d2=3; }
+            else if (type == "yolo")    { d1=6; d2=6; }
+            else if (type == "field")   { d1=6; d2=6; }
+            else                        { d1=4; d2=4; }  // high: total 8
+        }
+        else
+        {
+            d1 = ri(1,6); d2 = ri(1,6);
+        }
+
+        bool won; long long payout; Anope::string flavor;
+        eval_dice(type, d1, d2, amount, won, payout, flavor);
+
+        Anope::string f1 = (d1 >= 1 && d1 <= 6) ? Anope::string(DICE_FACES[d1]) : stringify(d1);
+        Anope::string f2 = (d2 >= 1 && d2 <= 6) ? Anope::string(DICE_FACES[d2]) : stringify(d2);
+
+        if (won)
+        {
+            u.coins += payout;
+            _update_highscore(u);
+            announce(src, "\002ROLL\002 " + f1 + f2 + " " + u.nick
+                + " rolls " + stringify(d1) + "+" + stringify(d2) + "=" + stringify(d1+d2)
+                + " on " + type + "! " + flavor
+                + " Payout: " + fmt_coins(payout) + ". Balance: \002" + fmt_coins(u.coins) + "\002");
+        }
+        else
+        {
+            announce(src, "\002ROLL\002 " + f1 + f2 + " " + u.nick
+                + " rolls " + stringify(d1) + "+" + stringify(d2) + "=" + stringify(d1+d2)
+                + " on " + type + ". " + flavor
+                + " Lost " + fmt_coins(amount) + ". Balance: \002" + fmt_coins(u.coins) + "\002");
+        }
+    }
+};
+
+// ===========================================================================
+// Slot machine helpers
+// ===========================================================================
+
+struct SlotPrize { int weight; long long payout; const char *reels; const char *msg; };
+
+static const SlotPrize PENNY_PRIZES[] = {
+    { 35, 0,    "--- --- ---", "Nothing. The machine laughs at you." },
+    { 20, 0,    "Lmn Chr ---", "Two fruits and a skull. Almost." },
+    { 12, 2,    "Chr Chr Lmn", "Two cherries! {coins} back." },
+    { 8,  5,    "Chr Chr Chr", "Triple cherries! +{coins}!" },
+    { 6,  15,   "Lmn Lmn Lmn", "Lemons! Sour but sweet -- +{coins}!" },
+    { 5,  50,   "BEL BEL BEL", "DING DING DING! +{coins}!" },
+    { 4,  150,  "DIA DIA BEL", "Diamonds and a bell! +{coins}!" },
+    { 3,  500,  "DIA DIA DIA", "TRIPLE DIAMONDS! +{coins}!" },
+    { 2,  1500, "FIR FIR FIR", "FIRE SPIN!!! +{coins}! The machine is SMOKING!" },
+    { 1,  5000, "777 777 777", "JACKPOT!!! +{coins}!!! THE CROWD GOES WILD!!!" },
+};
+static const int NUM_PENNY_PRIZES = 10;
+
+static const SlotPrize DOLLAR_PRIZES[] = {
+    { 30, 0,     "XXX XXX XXX", "Dead on arrival. The machine devours your dollar." },
+    { 18, 0,     "GRP ORG XXX", "Fruit salad of failure. Nothing." },
+    { 12, 50,    "ORG ORG GRP", "Two oranges! Partial refund -- {coins} back." },
+    { 9,  200,   "ORG ORG ORG", "Triple oranges! +{coins}!" },
+    { 7,  500,   "GRP GRP GRP", "Grapes! Wine money -- +{coins}!" },
+    { 6,  1500,  "MON MON GRP", "Two money bags! +{coins}!" },
+    { 5,  3000,  "MON MON MON", "TRIPLE MONEY BAGS! +{coins}!" },
+    { 4,  8000,  "STR STR MON", "Shooting stars! +{coins}!" },
+    { 3,  15000, "STR STR STR", "TRIPLE STARS! +{coins}! The machine is GLOWING!" },
+    { 2,  30000, "DIA FIR DIA", "INFERNO DIAMONDS! +{coins}! Security is on their way!" },
+    { 1,  50000, "JKP JKP JKP", "MEGA JACKPOT!!! +{coins}!!! THE FLOOR ERUPTS!!!" },
+};
+static const int NUM_DOLLAR_PRIZES = 11;
+
+static void spin_slot(const SlotPrize *prizes, int count, bool godmode,
+                      long long &payout, Anope::string &reels, Anope::string &msg)
+{
+    if (godmode)
+    {
+        const SlotPrize &p = prizes[count - 1];
+        payout = p.payout; reels = p.reels; msg = p.msg;
+        return;
+    }
+    int total = 0;
+    for (int i = 0; i < count; ++i) total += prizes[i].weight;
+    int roll = ri(1, total);
+    int cum = 0;
+    for (int i = 0; i < count; ++i)
+    {
+        cum += prizes[i].weight;
+        if (roll <= cum)
+        {
+            payout = prizes[i].payout;
+            reels  = prizes[i].reels;
+            msg    = prizes[i].msg;
+            return;
+        }
+    }
+    payout = 0; reels = prizes[0].reels; msg = prizes[0].msg;
+}
+
+// ---- PENNY ----
+struct CommandMugPenny : Command
+{
+    CommandMugPenny(Module *c) : Command(c, "mugserv/PENNY", 0, 0)
+    {
+        SetDesc("Pull the penny slot machine (1 coin per spin)");
+    }
+
+    void Execute(CommandSource &src, const std::vector<Anope::string> &) anope_override
+    {
+        if (check_gate(src)) return;
+        if (_flood_check(src)) return;
+        MugUser &u = s_users[src.nc->display.lower()];
+        time_t now = Anope::CurTime;
+
+        // Penny has its own cooldown stored in last_bet only if we share;
+        // we use a dedicated field via MugUser::last_coins trick — actually
+        // we reuse last_bet to share the CD as per Sopel design.
+        // For penny we store timestamp in a side-map using acct key.
+        static std::map<Anope::string, time_t> s_last_penny;
+        Anope::string key = src.nc->display.lower();
+        time_t &last_penny = s_last_penny[key];
+        int rem = (now - last_penny < static_cast<time_t>(PENNY_COOLDOWN))
+                  ? static_cast<int>(PENNY_COOLDOWN - (now - last_penny)) : 0;
+        if (rem > 0 && !is_admin(src))
+        {
+            pm(src, "The machine needs a second to cool down. " + fmt_dur(rem) + ".");
+            return;
+        }
+
+        if (u.coins < PENNY_COST)
+        {
+            pm(src, "You don't even have a single coin for the penny slot.");
+            return;
+        }
+
+        u.coins -= PENNY_COST;
+        last_penny = now;
+
+        long long payout; Anope::string reels, msg;
+        spin_slot(PENNY_PRIZES, NUM_PENNY_PRIZES,
+                  _has_godmode(src.nc->display), payout, reels, msg);
+
+        if (payout > 0)
+        {
+            u.coins += payout;
+            _update_highscore(u);
+        }
+
+        Anope::string msg_f = tpl(msg, mkv1("coins", fmt_coins(payout)));
+        announce(src, "\002PENNY\002 [" + reels + "] " + u.nick + " -- " + msg_f
+                      + " Balance: \002" + fmt_coins(u.coins) + "\002");
+    }
+};
+
+// ---- DOLLAR ----
+struct CommandMugDollar : Command
+{
+    CommandMugDollar(Module *c) : Command(c, "mugserv/DOLLAR", 0, 0)
+    {
+        SetDesc("Pull the dollar slot machine (100 coins per spin)");
+    }
+
+    void Execute(CommandSource &src, const std::vector<Anope::string> &) anope_override
+    {
+        if (check_gate(src)) return;
+        if (_flood_check(src)) return;
+        MugUser &u = s_users[src.nc->display.lower()];
+        time_t now = Anope::CurTime;
+
+        static std::map<Anope::string, time_t> s_last_dollar;
+        Anope::string key = src.nc->display.lower();
+        time_t &last_dollar = s_last_dollar[key];
+        int rem = (now - last_dollar < static_cast<time_t>(DOLLAR_COOLDOWN))
+                  ? static_cast<int>(DOLLAR_COOLDOWN - (now - last_dollar)) : 0;
+        if (rem > 0 && !is_admin(src))
+        {
+            pm(src, "The dollar machine is recalibrating. " + fmt_dur(rem) + ".");
+            return;
+        }
+
+        if (u.coins < DOLLAR_COST)
+        {
+            pm(src, "You need at least " + fmt_coins(DOLLAR_COST) + " for the dollar machine.");
+            return;
+        }
+
+        u.coins -= DOLLAR_COST;
+        last_dollar = now;
+
+        long long payout; Anope::string reels, msg;
+        spin_slot(DOLLAR_PRIZES, NUM_DOLLAR_PRIZES,
+                  _has_godmode(src.nc->display), payout, reels, msg);
+
+        if (payout > 0)
+        {
+            u.coins += payout;
+            _update_highscore(u);
+        }
+
+        Anope::string msg_f = tpl(msg, mkv1("coins", fmt_coins(payout)));
+        announce(src, "\002DOLLAR\002 [" + reels + "] " + u.nick + " -- " + msg_f
+                      + " Balance: \002" + fmt_coins(u.coins) + "\002");
+    }
+};
+
+// ===========================================================================
+// Roulette helpers
+// ===========================================================================
+
+static const int ROULETTE_REDS[] = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36};
+static const int NUM_ROULETTE_REDS = 18;
+
+static bool roulette_is_red(int n)
+{
+    for (int i = 0; i < NUM_ROULETTE_REDS; ++i)
+        if (ROULETTE_REDS[i] == n) return true;
+    return false;
+}
+
+static Anope::string roulette_color(int n)
+{
+    if (n == 0) return "green";
+    return roulette_is_red(n) ? "red" : "black";
+}
+
+// Returns false if bet_str is invalid
+static bool roulette_eval(const Anope::string &bet, int number,
+                          bool &won, int &mult, Anope::string &desc)
+{
+    Anope::string b = bet.lower();
+    Anope::string col = roulette_color(number);
+    if (b == "red")    { won = col=="red";   mult=2; desc="Red";       return true; }
+    if (b == "black")  { won = col=="black"; mult=2; desc="Black";     return true; }
+    if (b == "odd")    { won = number!=0 && number%2==1; mult=2; desc="Odd";  return true; }
+    if (b == "even")   { won = number!=0 && number%2==0; mult=2; desc="Even"; return true; }
+    if (b == "low")    { won = number>=1 && number<=18;  mult=2; desc="Low (1-18)";  return true; }
+    if (b == "high")   { won = number>=19 && number<=36; mult=2; desc="High (19-36)"; return true; }
+    if (b == "1st")    { won = number>=1 && number<=12;  mult=3; desc="1st Dozen"; return true; }
+    if (b == "2nd")    { won = number>=13 && number<=24; mult=3; desc="2nd Dozen"; return true; }
+    if (b == "3rd")    { won = number>=25 && number<=36; mult=3; desc="3rd Dozen"; return true; }
+    // Straight number
+    std::istringstream iss(b.c_str());
+    int target = -1;
+    if ((iss >> target) && target >= 0 && target <= 36)
+    {
+        won = number == target; mult = 36;
+        desc = "Straight " + stringify(target);
+        return true;
+    }
+    return false;
+}
+
+// ---- ROULETTE ----
+struct CommandMugRoulette : Command
+{
+    CommandMugRoulette(Module *c) : Command(c, "mugserv/ROULETTE", 2, 2)
+    {
+        SetDesc("Spin the roulette wheel");
+        SetSyntax("<amount> <red|black|odd|even|high|low|1st|2nd|3rd|0-36>");
+    }
+
+    void Execute(CommandSource &src, const std::vector<Anope::string> &params) anope_override
+    {
+        if (check_gate(src)) return;
+        if (_flood_check(src)) return;
+        MugUser &u = s_users[src.nc->display.lower()];
+
+        long long amount = parse_ll(params[0]);
+        if (amount < 1) { pm(src, "Amount must be >= 1."); return; }
+
+        Anope::string bet_str = params[1].lower();
+
+        // Validate bet (use number 0 as test)
+        bool twon; int tmult; Anope::string tdesc;
+        if (!roulette_eval(bet_str, 0, twon, tmult, tdesc))
+        {
+            pm(src, "Invalid bet. Options: red, black, odd, even, high, low, 1st, 2nd, 3rd, or 0-36.");
+            return;
+        }
+
+        int rem = cd_rem(u.last_bet, CD_BET);
+        if (rem > 0 && !is_admin(src))
+        {
+            pm(src, tpl(rand_pick_str(s_msg_bet_cd), mkv1("t", fmt_dur(rem))));
+            return;
+        }
+
+        if (u.coins < amount) { pm(src, rand_pick_str(s_msg_broke)); return; }
+
+        u.coins   -= amount;
+        u.last_bet = Anope::CurTime;
+
+        int number;
+        if (_has_godmode(src.nc->display))
+        {
+            // Rig for a win
+            if (bet_str == "red")        { number = ROULETTE_REDS[ri(0, NUM_ROULETTE_REDS-1)]; }
+            else if (bet_str == "black")
+            {
+                int blacks[] = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35};
+                number = blacks[ri(0,17)];
+            }
+            else if (bet_str == "odd")   { number = ri(0,17)*2+1; }
+            else if (bet_str == "even")  { number = ri(0,17)*2+2; }
+            else if (bet_str == "low")   { number = ri(1,18); }
+            else if (bet_str == "high")  { number = ri(19,36); }
+            else if (bet_str == "1st")   { number = ri(1,12); }
+            else if (bet_str == "2nd")   { number = ri(13,24); }
+            else if (bet_str == "3rd")   { number = ri(25,36); }
+            else { std::istringstream iss(bet_str.c_str()); iss >> number; }
+        }
+        else
+        {
+            number = ri(0, 36);
+        }
+
+        bool won; int mult; Anope::string desc;
+        roulette_eval(bet_str, number, won, mult, desc);
+
+        Anope::string col = roulette_color(number);
+        Anope::string col_tag = (col=="red") ? "\002RED\002" : (col=="black") ? "\002BLACK\002" : "\002GREEN\002";
+
+        if (won)
+        {
+            long long payout = amount * static_cast<long long>(mult);
+            u.coins += payout;
+            _update_highscore(u);
+            announce(src, "\002ROULETTE\002 " + col_tag + " " + stringify(number)
+                + " | " + u.nick + " bet " + desc + " -- \002WIN!\002 "
+                + "Payout: " + fmt_coins(payout) + " (" + stringify(mult) + "x). "
+                + "Balance: \002" + fmt_coins(u.coins) + "\002");
+        }
+        else
+        {
+            announce(src, "\002ROULETTE\002 " + col_tag + " " + stringify(number)
+                + " | " + u.nick + " bet " + desc + " -- nope. "
+                + "Lost " + fmt_coins(amount) + ". Balance: \002" + fmt_coins(u.coins) + "\002");
+        }
+    }
+};
+
+// ===========================================================================
+// Blackjack helpers
+// ===========================================================================
+
+static void bj_new_deck(BJHand &h)
+{
+    static const char *SUITS[] = { "s", "h", "d", "c" };
+    static const char *RANKS[] = { "A","2","3","4","5","6","7","8","9","10","J","Q","K" };
+    h.deck.clear();
+    for (int s = 0; s < 4; ++s)
+        for (int r = 0; r < 13; ++r)
+        {
+            BJHand::Card c;
+            c.rank = RANKS[r]; c.suit = SUITS[s];
+            h.deck.push_back(c);
+        }
+    // Shuffle (Fisher-Yates with ri)
+    for (int i = static_cast<int>(h.deck.size()) - 1; i > 0; --i)
+    {
+        int j = ri(0, i);
+        BJHand::Card tmp = h.deck[i];
+        h.deck[i] = h.deck[j];
+        h.deck[j] = tmp;
+    }
+}
+
+static BJHand::Card bj_draw(BJHand &h)
+{
+    BJHand::Card c = h.deck.back();
+    h.deck.pop_back();
+    return c;
+}
+
+static Anope::string bj_card_str(const BJHand::Card &c) { return c.rank + c.suit; }
+
+static Anope::string bj_hand_str(const std::vector<BJHand::Card> &hand)
+{
+    Anope::string s;
+    for (size_t i = 0; i < hand.size(); ++i)
+    {
+        if (i) s += " ";
+        s += bj_card_str(hand[i]);
+    }
+    return s;
+}
+
+static int bj_card_val(const Anope::string &rank)
+{
+    if (rank == "A") return 11;
+    if (rank == "K" || rank == "Q" || rank == "J") return 10;
+    std::istringstream iss(rank.c_str()); int v=0; iss>>v; return v;
+}
+
+static int bj_hand_val(const std::vector<BJHand::Card> &hand)
+{
+    int total = 0, aces = 0;
+    for (size_t i = 0; i < hand.size(); ++i)
+    {
+        total += bj_card_val(hand[i].rank);
+        if (hand[i].rank == "A") ++aces;
+    }
+    while (total > 21 && aces > 0) { total -= 10; --aces; }
+    return total;
+}
+
+static bool bj_is_blackjack(const std::vector<BJHand::Card> &hand)
+{
+    return hand.size() == 2 && bj_hand_val(hand) == 21;
+}
+
+static void bj_dealer_play(BJHand &h, bool godmode)
+{
+    if (godmode)
+    {
+        while (bj_hand_val(h.dealer) < 22 && !h.deck.empty())
+            h.dealer.push_back(bj_draw(h));
+        return;
+    }
+    while (bj_hand_val(h.dealer) < 17 && !h.deck.empty())
+        h.dealer.push_back(bj_draw(h));
+}
+
+static void bj_resolve(CommandSource &src, const Anope::string &nick,
+                       const Anope::string &acct_key, BJHand &game)
+{
+    MugUser &u = s_users[acct_key];
+    int hv = bj_hand_val(game.hand);
+    int dv = bj_hand_val(game.dealer);
+    long long amount = game.amount;
+    Anope::string chan = game.channel;
+
+    bool pbj = bj_is_blackjack(game.hand);
+    bool dbj = bj_is_blackjack(game.dealer);
+
+    Anope::string dstr = bj_hand_str(game.dealer);
+
+    if (pbj && dbj)
+    {
+        u.coins += amount;
+        IRCD->SendPrivmsg(MessageSource(s_bot), chan, "BJ: Dealer %s (%d) -- Both blackjack! Push. %s gets %s back. Balance: \002%s\002",
+            dstr.c_str(), dv, nick.c_str(), fmt_coins(amount).c_str(), fmt_coins(u.coins).c_str());
+    }
+    else if (pbj)
+    {
+        long long payout = amount * 5 / 2; // 2.5x
+        u.coins += payout;
+        _update_highscore(u);
+        IRCD->SendPrivmsg(MessageSource(s_bot), chan, "BJ: BLACKJACK! %s wins %s (2.5x)! Balance: \002%s\002",
+            nick.c_str(), fmt_coins(payout).c_str(), fmt_coins(u.coins).c_str());
+    }
+    else if (hv > 21)
+    {
+        IRCD->SendPrivmsg(MessageSource(s_bot), chan, "BJ: BUST! %s (%d). Dealer: %s (%d). %s lost %s. Balance: \002%s\002",
+            bj_hand_str(game.hand).c_str(), hv, dstr.c_str(), dv,
+            nick.c_str(), fmt_coins(amount).c_str(), fmt_coins(u.coins).c_str());
+    }
+    else if (dv > 21)
+    {
+        long long payout = amount * 2;
+        u.coins += payout;
+        _update_highscore(u);
+        IRCD->SendPrivmsg(MessageSource(s_bot), chan, "BJ: Dealer BUSTS! %s (%d). %s wins %s! Balance: \002%s\002",
+            dstr.c_str(), dv, nick.c_str(), fmt_coins(payout).c_str(), fmt_coins(u.coins).c_str());
+    }
+    else if (hv > dv)
+    {
+        long long payout = amount * 2;
+        u.coins += payout;
+        _update_highscore(u);
+        IRCD->SendPrivmsg(MessageSource(s_bot), chan, "BJ: %s (%d) vs Dealer %s (%d) -- %s WINS! +%s. Balance: \002%s\002",
+            bj_hand_str(game.hand).c_str(), hv, dstr.c_str(), dv,
+            nick.c_str(), fmt_coins(payout).c_str(), fmt_coins(u.coins).c_str());
+    }
+    else if (hv < dv)
+    {
+        IRCD->SendPrivmsg(MessageSource(s_bot), chan, "BJ: %s (%d) vs Dealer %s (%d) -- Dealer wins. %s lost %s. Balance: \002%s\002",
+            bj_hand_str(game.hand).c_str(), hv, dstr.c_str(), dv,
+            nick.c_str(), fmt_coins(amount).c_str(), fmt_coins(u.coins).c_str());
+    }
+    else
+    {
+        u.coins += amount;
+        IRCD->SendPrivmsg(MessageSource(s_bot), chan, "BJ: %s (%d) vs Dealer %s (%d) -- Push! %s gets %s back. Balance: \002%s\002",
+            bj_hand_str(game.hand).c_str(), hv, dstr.c_str(), dv,
+            nick.c_str(), fmt_coins(amount).c_str(), fmt_coins(u.coins).c_str());
+    }
+}
+
+// ---- BJ (start blackjack) ----
+struct CommandMugBJ : Command
+{
+    CommandMugBJ(Module *c) : Command(c, "mugserv/BJ", 1, 1)
+    {
+        SetDesc("Start a blackjack hand vs the dealer");
+        SetSyntax("<amount>");
+    }
+
+    void Execute(CommandSource &src, const std::vector<Anope::string> &params) anope_override
+    {
+        if (check_gate(src)) return;
+        if (_flood_check(src)) return;
+        Anope::string acct = src.nc->display.lower();
+        MugUser &u = s_users[acct];
+
+        if (s_bj_hands.count(acct))
+        {
+            BJHand &game = s_bj_hands[acct];
+            pm(src, "You already have a hand: " + bj_hand_str(game.hand)
+                    + " (" + stringify(bj_hand_val(game.hand)) + "). Use HIT, STAND, or DD.");
+            return;
+        }
+
+        int rem = cd_rem(u.last_bet, CD_BET);
+        if (rem > 0 && !is_admin(src))
+        {
+            pm(src, tpl(rand_pick_str(s_msg_bet_cd), mkv1("t", fmt_dur(rem))));
+            return;
+        }
+
+        long long amount = parse_ll(params[0]);
+        if (amount < 1) { pm(src, "Minimum bet is 1 coin."); return; }
+        if (u.coins < amount) { pm(src, rand_pick_str(s_msg_broke)); return; }
+
+        u.coins   -= amount;
+        u.last_bet = Anope::CurTime;
+
+        BJHand game;
+        bj_new_deck(game);
+        game.hand.push_back(bj_draw(game));
+        game.hand.push_back(bj_draw(game));
+        game.dealer.push_back(bj_draw(game));
+        game.dealer.push_back(bj_draw(game));
+        game.amount  = amount;
+        game.channel = s_current_chan.empty() ? Anope::string("") : s_current_chan;
+        game.doubled = false;
+
+        if (bj_is_blackjack(game.hand))
+        {
+            bj_dealer_play(game, _has_godmode(src.nc->display));
+            bj_resolve(src, src.GetNick(), acct, game);
+            return;
+        }
+
+        s_bj_hands[acct] = game;
+
+        Anope::string dealer_show = bj_card_str(game.dealer[0]);
+        announce(src, "\002BJ\002 " + src.GetNick()
+            + " -- Hand: " + bj_hand_str(game.hand)
+            + " (" + stringify(bj_hand_val(game.hand)) + ")"
+            + " | Dealer shows: " + dealer_show
+            + " | Use HIT, STAND, or DD");
+    }
+};
+
+// ---- HIT ----
+struct CommandMugHit : Command
+{
+    CommandMugHit(Module *c) : Command(c, "mugserv/HIT", 0, 0)
+    {
+        SetDesc("Draw another card in blackjack");
+    }
+
+    void Execute(CommandSource &src, const std::vector<Anope::string> &) anope_override
+    {
+        if (!src.nc) { pm(src, "Identify with NickServ first."); return; }
+        Anope::string acct = src.nc->display.lower();
+        std::map<Anope::string, BJHand>::iterator it = s_bj_hands.find(acct);
+        if (it == s_bj_hands.end())
+        {
+            pm(src, "You don't have a hand. Start one with BJ <amount>.");
+            return;
+        }
+        BJHand &game = it->second;
+        game.hand.push_back(bj_draw(game));
+        int hv = bj_hand_val(game.hand);
+
+        if (hv > 21)
+        {
+            BJHand copy = game;
+            s_bj_hands.erase(it);
+            bj_dealer_play(copy, false);
+            bj_resolve(src, src.GetNick(), acct, copy);
+            return;
+        }
+
+        announce(src, "\002BJ HIT\002 " + src.GetNick()
+            + " drew " + bj_card_str(game.hand.back())
+            + " -- Hand: " + bj_hand_str(game.hand)
+            + " (" + stringify(hv) + ") | HIT, STAND, or DD");
+    }
+};
+
+// ---- STAND ----
+struct CommandMugStand : Command
+{
+    CommandMugStand(Module *c) : Command(c, "mugserv/STAND", 0, 0)
+    {
+        SetDesc("Keep your hand, dealer plays");
+    }
+
+    void Execute(CommandSource &src, const std::vector<Anope::string> &) anope_override
+    {
+        if (!src.nc) { pm(src, "Identify with NickServ first."); return; }
+        Anope::string acct = src.nc->display.lower();
+        std::map<Anope::string, BJHand>::iterator it = s_bj_hands.find(acct);
+        if (it == s_bj_hands.end())
+        {
+            pm(src, "You don't have a hand. Start one with BJ <amount>.");
+            return;
+        }
+        BJHand game = it->second;
+        s_bj_hands.erase(it);
+        bj_dealer_play(game, _has_godmode(src.nc->display));
+        bj_resolve(src, src.GetNick(), acct, game);
+    }
+};
+
+// ---- DD (double down) ----
+struct CommandMugDD : Command
+{
+    CommandMugDD(Module *c) : Command(c, "mugserv/DD", 0, 0)
+    {
+        SetDesc("Double down in blackjack: double bet, draw one card, auto-stand");
+    }
+
+    void Execute(CommandSource &src, const std::vector<Anope::string> &) anope_override
+    {
+        if (!src.nc) { pm(src, "Identify with NickServ first."); return; }
+        Anope::string acct = src.nc->display.lower();
+        std::map<Anope::string, BJHand>::iterator it = s_bj_hands.find(acct);
+        if (it == s_bj_hands.end())
+        {
+            pm(src, "You don't have a hand. Start one with BJ <amount>.");
+            return;
+        }
+        BJHand &game = it->second;
+        if (game.hand.size() != 2)
+        {
+            pm(src, "You can only double down on your first two cards.");
+            return;
+        }
+        if (game.doubled) { pm(src, "Already doubled!"); return; }
+
+        MugUser &u = s_users[acct];
+        if (u.coins < game.amount)
+        {
+            pm(src, "You need " + fmt_coins(game.amount) + " more to double down.");
+            return;
+        }
+        u.coins     -= game.amount;
+        game.amount *= 2;
+        game.doubled = true;
+        game.hand.push_back(bj_draw(game));
+
+        BJHand copy = game;
+        s_bj_hands.erase(it);
+
+        announce(src, "\002BJ DD\002 DOUBLE DOWN! " + src.GetNick()
+            + " drew " + bj_card_str(copy.hand.back())
+            + " -- Hand: " + bj_hand_str(copy.hand)
+            + " (" + stringify(bj_hand_val(copy.hand)) + ")");
+
+        bj_dealer_play(copy, _has_godmode(src.nc->display));
+        bj_resolve(src, src.GetNick(), acct, copy);
+    }
+};
+
+// ===========================================================================
+// Texas Hold'em helpers
+// ===========================================================================
+
+static const int HOLDEM_RANK_VALUES[] = {0,0,2,3,4,5,6,7,8,9,10,11,12,13,14};
+// rank char -> value: A=14
+
+static int holdem_rank_val(const Anope::string &rank)
+{
+    if (rank == "A") return 14;
+    if (rank == "K") return 13;
+    if (rank == "Q") return 12;
+    if (rank == "J") return 11;
+    std::istringstream iss(rank.c_str()); int v=0; iss>>v; return v;
+}
+
+struct HoldemScore
+{
+    int rank; // 0=high card ... 9=royal flush
+    int tb[5]; // tiebreakers
+    HoldemScore() : rank(0) { for(int i=0;i<5;i++) tb[i]=0; }
+    bool operator>(const HoldemScore &o) const
+    {
+        if (rank != o.rank) return rank > o.rank;
+        for (int i=0;i<5;i++) if(tb[i]!=o.tb[i]) return tb[i]>o.tb[i];
+        return false;
+    }
+    bool operator==(const HoldemScore &o) const
+    {
+        if (rank != o.rank) return false;
+        for (int i=0;i<5;i++) if(tb[i]!=o.tb[i]) return false;
+        return true;
+    }
+};
+
+static HoldemScore holdem_score_five(const BJHand::Card five[5])
+{
+    int ranks[5]; Anope::string suits[5];
+    for (int i=0;i<5;i++) { ranks[i]=holdem_rank_val(five[i].rank); suits[i]=five[i].suit; }
+    // Sort ranks descending
+    for (int i=0;i<4;i++) for(int j=i+1;j<5;j++) if(ranks[j]>ranks[i]){ int t=ranks[i];ranks[i]=ranks[j];ranks[j]=t; }
+    bool is_flush = (suits[0]==suits[1]&&suits[1]==suits[2]&&suits[2]==suits[3]&&suits[3]==suits[4]);
+    bool is_straight = (ranks[0]-ranks[4]==4 && (ranks[0]!=ranks[1]&&ranks[1]!=ranks[2]&&ranks[2]!=ranks[3]&&ranks[3]!=ranks[4]));
+    // Ace-low straight
+    bool ace_low = (ranks[0]==14&&ranks[1]==5&&ranks[2]==4&&ranks[3]==3&&ranks[4]==2);
+    int straight_high = ace_low ? 5 : ranks[0];
+
+    // Count rank groups
+    int cnt[15] = {};
+    for (int i=0;i<5;i++) cnt[ranks[i]]++;
+    int quad=-1,trip=-1,pair1=-1,pair2=-1;
+    for (int r=14;r>=2;r--)
+    {
+        if(cnt[r]==4) quad=r;
+        else if(cnt[r]==3) trip=r;
+        else if(cnt[r]==2) { if(pair1<0) pair1=r; else pair2=r; }
+    }
+
+    HoldemScore s;
+    if (is_flush && (is_straight||ace_low))
+    {
+        s.rank = (straight_high==14&&!ace_low) ? 9 : 8;
+        s.tb[0] = straight_high; return s;
+    }
+    if (quad>=0) { s.rank=7; s.tb[0]=quad; for(int r=14;r>=2;r--) if(cnt[r]==1){s.tb[1]=r;break;} return s; }
+    if (trip>=0&&pair1>=0) { s.rank=6; s.tb[0]=trip; s.tb[1]=pair1; return s; }
+    if (is_flush) { s.rank=5; for(int i=0;i<5;i++) s.tb[i]=ranks[i]; return s; }
+    if (is_straight||ace_low) { s.rank=4; s.tb[0]=straight_high; return s; }
+    if (trip>=0) { s.rank=3; s.tb[0]=trip; int ki=0; for(int r=14;r>=2;r--) if(cnt[r]==1&&ki<2){s.tb[1+ki]=r;ki++;} return s; }
+    if (pair1>=0&&pair2>=0) { s.rank=2; s.tb[0]=pair1; s.tb[1]=pair2; for(int r=14;r>=2;r--) if(cnt[r]==1){s.tb[2]=r;break;} return s; }
+    if (pair1>=0) { s.rank=1; s.tb[0]=pair1; int ki=0; for(int r=14;r>=2;r--) if(cnt[r]==1&&ki<3){s.tb[1+ki]=r;ki++;} return s; }
+    s.rank=0; for(int i=0;i<5;i++) s.tb[i]=ranks[i]; return s;
+}
+
+static HoldemScore holdem_best_hand(const std::vector<BJHand::Card> &all7, Anope::string &hand_name)
+{
+    static const char *HAND_NAMES[] = { "High Card","One Pair","Two Pair","Three of a Kind",
+        "Straight","Flush","Full House","Four of a Kind","Straight Flush","Royal Flush" };
+    HoldemScore best;
+    bool first = true;
+    // Iterate all C(7,5) = 21 combinations
+    for (int a=0;a<7;a++) for(int b=a+1;b<7;b++)
+    {
+        // pick 5 that are NOT a and b
+        BJHand::Card five[5]; int fi=0;
+        for(int i=0;i<7;i++) if(i!=a&&i!=b) five[fi++]=all7[i];
+        HoldemScore sc = holdem_score_five(five);
+        if (first || sc > best) { best = sc; first = false; }
+    }
+    hand_name = (best.rank>=0&&best.rank<=9) ? HAND_NAMES[best.rank] : "Unknown";
+    return best;
+}
+
+static const int HOLDEM_PAYOUTS[] = { 2,2,2,2,3,4,6,12,25,50 };
+
+// ---- HOLDEM ----
+struct CommandMugHoldem : Command
+{
+    CommandMugHoldem(Module *c) : Command(c, "mugserv/HOLDEM", 1, 1)
+    {
+        SetDesc("Heads-up Texas Hold'em vs the dealer");
+        SetSyntax("<amount>");
+    }
+
+    void Execute(CommandSource &src, const std::vector<Anope::string> &params) anope_override
+    {
+        if (check_gate(src)) return;
+        if (_flood_check(src)) return;
+        MugUser &u = s_users[src.nc->display.lower()];
+
+        int rem = cd_rem(u.last_bet, CD_BET);
+        if (rem > 0 && !is_admin(src))
+        {
+            pm(src, tpl(rand_pick_str(s_msg_bet_cd), mkv1("t", fmt_dur(rem))));
+            return;
+        }
+
+        long long amount = parse_ll(params[0]);
+        if (amount < 1) { pm(src, "Minimum bet is 1 coin."); return; }
+        if (u.coins < amount) { pm(src, rand_pick_str(s_msg_broke)); return; }
+
+        u.coins   -= amount;
+        u.last_bet = Anope::CurTime;
+
+        // Build deck via a BJHand (reuses the same shuffle logic)
+        BJHand tmp;
+        bj_new_deck(tmp);
+
+        std::vector<BJHand::Card> p_hole, d_hole, community;
+        p_hole.push_back(bj_draw(tmp)); p_hole.push_back(bj_draw(tmp));
+        d_hole.push_back(bj_draw(tmp)); d_hole.push_back(bj_draw(tmp));
+        for (int i=0;i<5;i++) community.push_back(bj_draw(tmp));
+
+        std::vector<BJHand::Card> p_all = p_hole; p_all.insert(p_all.end(), community.begin(), community.end());
+        std::vector<BJHand::Card> d_all = d_hole; d_all.insert(d_all.end(), community.begin(), community.end());
+
+        Anope::string p_name, d_name;
+        HoldemScore p_score = holdem_best_hand(p_all, p_name);
+        HoldemScore d_score = holdem_best_hand(d_all, d_name);
+
+        // God mode: re-deal player hole until player wins
+        if (_has_godmode(src.nc->display) && !(p_score > d_score))
+        {
+            for (int attempt = 0; attempt < 50; ++attempt)
+            {
+                BJHand tmp2; bj_new_deck(tmp2);
+                p_hole.clear(); d_hole.clear();
+                p_hole.push_back(bj_draw(tmp2)); p_hole.push_back(bj_draw(tmp2));
+                d_hole.push_back(bj_draw(tmp2)); d_hole.push_back(bj_draw(tmp2));
+                p_all = p_hole; p_all.insert(p_all.end(), community.begin(), community.end());
+                d_all = d_hole; d_all.insert(d_all.end(), community.begin(), community.end());
+                p_score = holdem_best_hand(p_all, p_name);
+                d_score = holdem_best_hand(d_all, d_name);
+                if (p_score > d_score) break;
+            }
+        }
+
+        Anope::string hole_str = bj_hand_str(p_hole);
+        Anope::string d_hole_str = bj_hand_str(d_hole);
+        Anope::string comm_str = bj_hand_str(community);
+
+        if (p_score == d_score)
+        {
+            u.coins += amount;
+            announce(src, "\002HOLDEM\002 " + hole_str + " | Board: " + comm_str
+                + " | Dealer: " + d_hole_str + " -- Both " + p_name + "! Push. "
+                + src.GetNick() + " gets " + fmt_coins(amount) + " back. Balance: \002"
+                + fmt_coins(u.coins) + "\002");
+        }
+        else if (p_score > d_score)
+        {
+            int mult = HOLDEM_PAYOUTS[p_score.rank];
+            long long payout = amount * static_cast<long long>(mult);
+            u.coins += payout;
+            _update_highscore(u);
+            announce(src, "\002HOLDEM\002 " + hole_str + " | Board: " + comm_str
+                + " | Dealer: " + d_hole_str + " -- \002" + p_name + "\002 beats "
+                + d_name + "! " + src.GetNick() + " wins " + fmt_coins(payout)
+                + " (" + stringify(mult) + "x)! Balance: \002" + fmt_coins(u.coins) + "\002");
+        }
+        else
+        {
+            announce(src, "\002HOLDEM\002 " + hole_str + " | Board: " + comm_str
+                + " | Dealer: " + d_hole_str + " -- Dealer's \002" + d_name + "\002 beats "
+                + p_name + ". " + src.GetNick() + " lost " + fmt_coins(amount)
+                + ". Balance: \002" + fmt_coins(u.coins) + "\002");
+        }
+    }
+};
+
 // ===========================================================================
 // Module class
 // ===========================================================================
 
 class ModuleMugServ : public Module
 {
-    CommandMugCoins     cmd_coins;
-    CommandMugBalance   cmd_balance;
-    CommandMugGive      cmd_give;
-    CommandMugMug       cmd_mug;
-    CommandMugBet       cmd_bet;
-    CommandMugBounty    cmd_bounty;
-    CommandMugBounties  cmd_bounties;
-    CommandMugJail      cmd_jail;
-    CommandMugShop      cmd_shop;
-    CommandMugBuy       cmd_buy;
-    CommandMugInv       cmd_inv;
-    CommandMugUse       cmd_use;
-    CommandMugTop5      cmd_top5;
-    CommandMugTop10     cmd_top10;
-    CommandMugAdd       cmd_mugadd;
-    CommandMugSet       cmd_mugset;
-    CommandMugTake      cmd_mugtake;
-    CommandMugReset     cmd_mugreset;
-    CommandMugStats     cmd_mugstats;
-    CommandMugHelp      cmd_help;
-    CommandMugEnable    cmd_enable;
-    CommandMugDisable   cmd_disable;
+    CommandMugCoins       cmd_coins;
+    CommandMugBalance     cmd_balance;
+    CommandMugGive        cmd_give;
+    CommandMugMug         cmd_mug;
+    CommandMugBet         cmd_bet;
+    CommandMugBounty      cmd_bounty;
+    CommandMugBounties    cmd_bounties;
+    CommandMugJail        cmd_jail;
+    CommandMugShop        cmd_shop;
+    CommandMugBuy         cmd_buy;
+    CommandMugInv         cmd_inv;
+    CommandMugUse         cmd_use;
+    CommandMugTop5        cmd_top5;
+    CommandMugTop10       cmd_top10;
+    CommandMugAdd         cmd_mugadd;
+    CommandMugSet         cmd_mugset;
+    CommandMugTake        cmd_mugtake;
+    CommandMugReset       cmd_mugreset;
+    CommandMugStats       cmd_mugstats;
+    CommandMugHelp        cmd_help;
+    CommandMugEnable      cmd_enable;
+    CommandMugDisable     cmd_disable;
+    // New commands
+    CommandMugToggle      cmd_mugtoggle;
+    CommandMugGodMode     cmd_godmode;
+    CommandMugUncooldown  cmd_uncooldown;
+    CommandMugHighScore   cmd_highscore;
+    CommandMugRoll        cmd_roll;
+    CommandMugPenny       cmd_penny;
+    CommandMugDollar      cmd_dollar;
+    CommandMugRoulette    cmd_roulette;
+    CommandMugBJ          cmd_bj;
+    CommandMugHit         cmd_hit;
+    CommandMugStand       cmd_stand;
+    CommandMugDD          cmd_dd;
+    CommandMugHoldem      cmd_holdem;
 
-    MugSaveTimer        save_timer;
+    MugSaveTimer          save_timer;
 
 public:
     ModuleMugServ(const Anope::string &modname, const Anope::string &creator)
         : Module(modname, creator, THIRD)
-        , cmd_coins(this),    cmd_balance(this)
-        , cmd_give(this),      cmd_mug(this),       cmd_bet(this)
-        , cmd_bounty(this),    cmd_bounties(this),  cmd_jail(this)
-        , cmd_shop(this),      cmd_buy(this),       cmd_inv(this)
-        , cmd_use(this),       cmd_top5(this),      cmd_top10(this)
-        , cmd_mugadd(this),    cmd_mugset(this),    cmd_mugtake(this)
-        , cmd_mugreset(this),  cmd_mugstats(this),  cmd_help(this)
-        , cmd_enable(this),    cmd_disable(this)
+        , cmd_coins(this),      cmd_balance(this)
+        , cmd_give(this),       cmd_mug(this),       cmd_bet(this)
+        , cmd_bounty(this),     cmd_bounties(this),  cmd_jail(this)
+        , cmd_shop(this),       cmd_buy(this),       cmd_inv(this)
+        , cmd_use(this),        cmd_top5(this),      cmd_top10(this)
+        , cmd_mugadd(this),     cmd_mugset(this),    cmd_mugtake(this)
+        , cmd_mugreset(this),   cmd_mugstats(this),  cmd_help(this)
+        , cmd_enable(this),     cmd_disable(this)
+        , cmd_mugtoggle(this),  cmd_godmode(this),   cmd_uncooldown(this)
+        , cmd_highscore(this)
+        , cmd_roll(this),       cmd_penny(this),     cmd_dollar(this)
+        , cmd_roulette(this)
+        , cmd_bj(this),         cmd_hit(this),       cmd_stand(this)
+        , cmd_dd(this),         cmd_holdem(this)
         , save_timer(this)
     {
         s_module = this;
@@ -1933,10 +3251,26 @@ public:
         s_bot->SetCommand("MUGTAKE",   "mugserv/MUGTAKE");
         s_bot->SetCommand("MUGRESET",  "mugserv/MUGRESET");
         s_bot->SetCommand("MUGSTATS",  "mugserv/MUGSTATS");
-        s_bot->SetCommand("HELP",      "mugserv/HELP");
-        s_bot->SetCommand("COMMANDS",  "mugserv/HELP");
-        s_bot->SetCommand("ENABLE",    "mugserv/ENABLE");
-        s_bot->SetCommand("DISABLE",   "mugserv/DISABLE");
+        s_bot->SetCommand("HELP",       "mugserv/HELP");
+        s_bot->SetCommand("COMMANDS",   "mugserv/HELP");
+        s_bot->SetCommand("ENABLE",     "mugserv/ENABLE");
+        s_bot->SetCommand("DISABLE",    "mugserv/DISABLE");
+        s_bot->SetCommand("MUGTOGGLE",  "mugserv/MUGTOGGLE");
+        s_bot->SetCommand("TOGGLE",     "mugserv/MUGTOGGLE");
+        s_bot->SetCommand("GODMODE",    "mugserv/GODMODE");
+        s_bot->SetCommand("UNCOOLDOWN", "mugserv/UNCOOLDOWN");
+        s_bot->SetCommand("HIGHSCORE",  "mugserv/HIGHSCORE");
+        s_bot->SetCommand("ROLL",       "mugserv/ROLL");
+        s_bot->SetCommand("DICE",       "mugserv/ROLL");
+        s_bot->SetCommand("PENNY",      "mugserv/PENNY");
+        s_bot->SetCommand("DOLLAR",     "mugserv/DOLLAR");
+        s_bot->SetCommand("ROULETTE",   "mugserv/ROULETTE");
+        s_bot->SetCommand("BJ",         "mugserv/BJ");
+        s_bot->SetCommand("BLACKJACK",  "mugserv/BJ");
+        s_bot->SetCommand("HIT",        "mugserv/HIT");
+        s_bot->SetCommand("STAND",      "mugserv/STAND");
+        s_bot->SetCommand("DD",         "mugserv/DD");
+        s_bot->SetCommand("HOLDEM",     "mugserv/HOLDEM");
 
         for (std::set<Anope::string>::const_iterator ci = s_channels.begin(); ci != s_channels.end(); ++ci)
         {
@@ -1953,6 +3287,8 @@ public:
             return;
         Anope::string chanlow = c->name.lower();
         if (!s_channels.count(chanlow))
+            return;
+        if (!_plugin_enabled(chanlow))
             return;
         if (!s_bot)
             return;
@@ -1973,7 +3309,8 @@ public:
         // Commands that must be used in PM only.
         if (lverb == "shop" || lverb == "buy" || lverb == "inv" || lverb == "inventory"
             || lverb == "use" || lverb == "mugadd" || lverb == "mugset" || lverb == "mugtake"
-            || lverb == "mugreset" || lverb == "mugstats" || lverb == "enable" || lverb == "disable")
+            || lverb == "mugreset" || lverb == "mugstats" || lverb == "enable" || lverb == "disable"
+            || lverb == "godmode" || lverb == "uncooldown")
         {
             IRCD->SendPrivmsg(MessageSource(s_bot), c->name, "%s: Please /msg %s %s%s for that command.",
                 u->nick.c_str(), s_bot->nick.c_str(), verb.upper().c_str(),
@@ -2024,6 +3361,9 @@ public:
         if (svcmd == "BAL")       svcmd = "BALANCE";
         if (svcmd == "INVENTORY") svcmd = "INV";
         if (svcmd == "COMMANDS")  svcmd = "HELP";
+        if (svcmd == "TOGGLE")    svcmd = "MUGTOGGLE";
+        if (svcmd == "DICE")      svcmd = "ROLL";
+        if (svcmd == "BLACKJACK") svcmd = "BJ";
 
         CommandInfo::map::iterator ci = s_bot->commands.find(svcmd);
         if (ci == s_bot->commands.end()) return;
